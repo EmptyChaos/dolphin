@@ -334,7 +334,7 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
     PanicAlertT("OpenAL: Failed to make context current: %08X", alcGetError(nullptr));
     return false;
   }
-  Common::ScopeGuard context_reset([] { alcMakeContextCurrent(nullptr); });
+  auto context_reset = Common::MakeScopeGuard([] { alcMakeContextCurrent(nullptr); });
 
   alGenBuffers(NUM_BUFFERS, m_idle_buffers.data());
   ALenum err = alGetError();
@@ -343,7 +343,7 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
     PanicAlertT("OpenAL: Could not create audio buffers: %08X", err);
     return false;
   }
-  Common::ScopeGuard buffer_release([&] {
+  auto buffer_release = Common::MakeScopeGuard([&] {
     alDeleteBuffers(NUM_BUFFERS, m_idle_buffers.data());
     std::fill_n(m_idle_buffers.data(), NUM_BUFFERS, 0);
   });
@@ -355,7 +355,7 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
     PanicAlertT("OpenAL: Could not create audio source: %08X", err);
     return false;
   }
-  Common::ScopeGuard source_release([&] {
+  auto source_release = Common::MakeScopeGuard([&] {
     alDeleteSources(1, &m_source);
     m_source = 0;
   });

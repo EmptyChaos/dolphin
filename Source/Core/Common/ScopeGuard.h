@@ -4,40 +4,54 @@
 
 #pragma once
 
-#include <functional>
+#include <utility>
 
 namespace Common
 {
+// Generic generalized RAII helper object.
+// It runs an arbitrary Functor (lambda usually) when it's destroyed.
+// Use "auto var = Common::MakeScopeGuard([&] { ... });" to use it.
+// NOTE: This should only be used for one-shot problems. If a destruction
+//   pattern occurs multiple times then a specialized handle class is cleaner.
+template <class Functor>
 class ScopeGuard final
 {
 public:
-  template <class Callable>
-  ScopeGuard(Callable&& finalizer) : m_finalizer(std::forward<Callable>(finalizer))
+  explicit ScopeGuard(Functor&& f) : m_functor(std::forward<Functor>(f)) {}
+  ScopeGuard(ScopeGuard&& other) : m_functor(std::move(other.m_functor)), m_run(other.m_run)
   {
+    other.m_run = false;
   }
-
-  ScopeGuard(ScopeGuard&& other) : m_finalizer(std::move(other.m_finalizer))
-  {
-    other.m_finalizer = nullptr;
-  }
-
   ~ScopeGuard() { Exit(); }
-  void Dismiss() { m_finalizer = nullptr; }
+  ScopeGuard& operator=(ScopeGuard&& other)
+  {
+    m_functor = std::move(other.m_functor);
+    m_run = other.m_run;
+    other.m_run = false;
+    return *this;
+  }
+
   void Exit()
   {
-    if (m_finalizer)
-    {
-      m_finalizer();  // must not throw
-      m_finalizer = nullptr;
-    }
+    if (!m_run)
+      return;
+
+    Dismiss();
+    m_functor();
   }
 
-  ScopeGuard(const ScopeGuard&) = delete;
-
-  void operator=(const ScopeGuard&) = delete;
-
+  void Dismiss() { m_run = false; }
 private:
-  std::function<void()> m_finalizer;
+  Functor m_functor;
+  bool m_run = true;
 };
+
+// Factory function to produce a ScopeGuard using automatic template
+// argument deduction (important because Lambdas have anonymous types).
+template <class Functor>
+ScopeGuard<Functor> MakeScopeGuard(Functor&& f)
+{
+  return ScopeGuard<Functor>(std::forward<Functor>(f));
+}
 
 }  // Namespace Common

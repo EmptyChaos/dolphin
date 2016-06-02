@@ -294,7 +294,7 @@ static void CompressAndDumpState(CompressAndDumpState_args save_args)
   // on_exit"
   // is created before the "IOFile f", it is guaranteed that the file will be finalized before
   // the ScopeGuard's finalization (i.e. "g_compressAndDumpStateSyncEvent.Set()" call).
-  Common::ScopeGuard on_exit([]() { g_compressAndDumpStateSyncEvent.Set(); });
+  auto on_exit = Common::MakeScopeGuard([]() { g_compressAndDumpStateSyncEvent.Set(); });
   // If it is not required to wait, we call finalizer early (and it won't be called again at
   // destruction).
   if (!save_args.wait)
