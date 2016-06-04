@@ -39,8 +39,6 @@ public:
   void StartLogDSPAudio(const std::string& filename);
   void StopLogDSPAudio();
 
-  float GetCurrentSpeed() const { return m_speed.load(); }
-  void UpdateSpeed(float val) { m_speed.store(val); }
 private:
   static constexpr u32 MAX_SAMPLES = 1024 * 4;  // 128 ms
   static constexpr u32 INDEX_MASK = MAX_SAMPLES * 2 - 1;
@@ -86,7 +84,4 @@ private:
 
   bool m_log_dtk_audio = false;
   bool m_log_dsp_audio = false;
-
-  // Current rate of emulation (1.0 = 100% speed)
-  std::atomic<float> m_speed{0.0f};
 };
