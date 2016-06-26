@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <array>
 #include <string>
 #include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
@@ -33,12 +32,9 @@ public:
   void AddStereoSamplesBE(const short* sample_data, u32 count, int sample_rate);  // big endian
   u32 GetAudioSize() const { return audio_size; }
 private:
-  static constexpr size_t BUFFER_SIZE = 32 * 1024;
-
   File::IOFile file;
   bool skip_silence = false;
   u32 audio_size = 0;
-  std::array<short, BUFFER_SIZE> conv_buffer{};
   void Write(u32 value);
   void Write4(const char* ptr);
   std::string basename;

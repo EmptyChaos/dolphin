@@ -2,14 +2,14 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <array>
 #include <string>
 
 #include "AudioCommon/WaveFile.h"
 #include "Common/CommonTypes.h"
-#include "Common/Logging/Log.h"
+#include "Common/MsgHandler.h"
 #include "Core/ConfigManager.h"
-
-constexpr size_t WaveFileWriter::BUFFER_SIZE;
 
 WaveFileWriter::WaveFileWriter()
 {
@@ -17,7 +17,8 @@ WaveFileWriter::WaveFileWriter()
 
 WaveFileWriter::~WaveFileWriter()
 {
-  Stop();
+  if (file)
+    Stop();
 }
 
 bool WaveFileWriter::Start(const std::string& filename, unsigned int HLESampleRate)
@@ -96,32 +97,13 @@ void WaveFileWriter::Write4(const char* ptr)
 
 void WaveFileWriter::AddStereoSamplesBE(const short* sample_data, u32 count, int sample_rate)
 {
+  static constexpr u32 STEREO_CHANNELS = 2;
   if (!file)
     PanicAlertT("WaveFileWriter - file not open.");
 
-  if (count > BUFFER_SIZE * 2)
-    PanicAlert("WaveFileWriter - buffer too small (count = %u).", count);
-
-  if (skip_silence)
-  {
-    bool all_zero = true;
-
-    for (u32 i = 0; i < count * 2; i++)
-    {
-      if (sample_data[i])
-        all_zero = false;
-    }
-
-    if (all_zero)
-      return;
-  }
-
-  for (u32 i = 0; i < count; i++)
-  {
-    // Flip the audio channels from RL to LR
-    conv_buffer[2 * i] = Common::swap16((u16)sample_data[2 * i + 1]);
-    conv_buffer[2 * i + 1] = Common::swap16((u16)sample_data[2 * i]);
-  }
+  if (skip_silence && std::all_of(sample_data, sample_data + count * STEREO_CHANNELS,
+                                  [](short sample) { return !sample; }))
+    return;
 
   if (sample_rate != current_sample_rate)
   {
@@ -133,6 +115,24 @@ void WaveFileWriter::AddStereoSamplesBE(const short* sample_data, u32 count, int
     current_sample_rate = sample_rate;
   }
 
-  file.WriteBytes(conv_buffer.data(), count * 4);
-  audio_size += count * 4;
+  static constexpr u32 NUM_PASS_FRAMES = 2048;
+  std::array<short, NUM_PASS_FRAMES * STEREO_CHANNELS> buffer;
+
+  for (u32 i = 0; i < count;)
+  {
+    u32 pass = std::min(NUM_PASS_FRAMES, count - i);
+    for (u32 end = i + pass; i < end; ++i)
+    {
+      // Swap RL -> LR. Convert from BE.
+      buffer[STEREO_CHANNELS * i] = Common::swap16(sample_data[STEREO_CHANNELS * i + 1]);
+      buffer[STEREO_CHANNELS * i + 1] = Common::swap16(sample_data[STEREO_CHANNELS * i]);
+    }
+
+    if (!file.WriteBytes(buffer.data(), pass * sizeof(short) * STEREO_CHANNELS))
+    {
+      file.Clear();
+      break;
+    }
+    audio_size += pass;
+  }
 }
