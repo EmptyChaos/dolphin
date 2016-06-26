@@ -124,6 +124,12 @@ void DoState(PointerWrap& p)
   p.Do(g_AISSampleRate);
   p.Do(g_AIDSampleRate);
   p.Do(g_CPUCyclesPerSample);
+
+  if (p.GetMode() == PointerWrap::MODE_READ)
+  {
+    g_sound_stream->GetMixer()->SetDMAInputSampleRate(g_AIDSampleRate);
+    g_sound_stream->GetMixer()->SetStreamInputSampleRate(g_AISSampleRate);
+  }
 }
 
 static void GenerateAudioInterrupt();
@@ -291,6 +297,11 @@ bool IsPlaying()
 unsigned int GetAIDSampleRate()
 {
   return g_AIDSampleRate;
+}
+
+unsigned int GetAISSampleRate()
+{
+  return g_AISSampleRate;
 }
 
 static void Update(u64 userdata, s64 cyclesLate)
