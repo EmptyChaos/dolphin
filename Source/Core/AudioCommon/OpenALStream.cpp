@@ -2,8 +2,9 @@
 // Licensed under GPLv2+
 // Refer to the license.txt file included.
 
-#include <cstring>
+#include <algorithm>
 #include <thread>
+#include <unordered_set>
 
 #include "AudioCommon/DPL2Decoder.h"
 #include "AudioCommon/OpenALStream.h"
@@ -13,19 +14,40 @@
 #include "Core/ConfigManager.h"
 
 #if defined HAVE_OPENAL && HAVE_OPENAL
+#ifdef __APPLE__
+// Avoid conflict with objc.h (on Windows, ST uses the system BOOL type, so this doesn't work)
+#define BOOL SoundTouch_BOOL
+#endif
+
+#include <soundtouch/STTypes.h>
+#include <soundtouch/SoundTouch.h>
+
+#ifdef __APPLE__
+#undef BOOL
+#endif
+
+// 16 bit Stereo
+#define SFX_MAX_SOURCE 1
+#define OAL_MAX_BUFFERS 30
+#define OAL_MAX_SAMPLES 256
+#define STEREO_CHANNELS 2
+#define SURROUND_CHANNELS 6  // number of channels in surround mode
+#define SIZE_SHORT 2
+#define SIZE_FLOAT 4  // size of a float in bytes
+#define FRAME_STEREO_SHORT (STEREO_CHANNELS * SIZE_SHORT)
+#define FRAME_STEREO_FLOAT (STEREO_CHANNELS * SIZE_FLOAT)
+#define FRAME_SURROUND_FLOAT (SURROUND_CHANNELS * SIZE_FLOAT)
+#define FRAME_SURROUND_SHORT (SURROUND_CHANNELS * SIZE_SHORT)
 
 #ifdef _WIN32
 #pragma comment(lib, "openal32.lib")
 #endif
-
-static soundtouch::SoundTouch soundTouch;
 
 //
 // AyuanX: Spec says OpenAL1.1 is thread safe already
 //
 bool OpenALStream::Start()
 {
-  m_run_thread.Set();
   bool bReturn = false;
 
   ALDeviceList pDeviceList;
@@ -47,6 +69,7 @@ bool OpenALStream::Start()
         // period_size_in_millisec = 1000 / refresh;
 
         alcMakeContextCurrent(pContext);
+        m_run_thread.Set();
         thread = std::thread(&OpenALStream::SoundLoop, this);
         bReturn = true;
       }
@@ -69,7 +92,6 @@ bool OpenALStream::Start()
   // Initialize DPL2 parameters
   DPL2Reset();
 
-  soundTouch.clear();
   return bReturn;
 }
 
@@ -79,17 +101,7 @@ void OpenALStream::Stop()
   // kick the thread if it's waiting
   soundSyncEvent.Set();
 
-  soundTouch.clear();
-
   thread.join();
-
-  alSourceStop(uiSource);
-  alSourcei(uiSource, AL_BUFFER, 0);
-
-  // Clean up buffers and sources
-  alDeleteSources(1, &uiSource);
-  uiSource = 0;
-  alDeleteBuffers(numBuffers, uiBuffers);
 
   ALCcontext* pContext = alcGetCurrentContext();
   ALCdevice* pDevice = alcGetContextsDevice(pContext);
@@ -114,11 +126,11 @@ void OpenALStream::Update()
 
 void OpenALStream::Clear(bool mute)
 {
+  std::lock_guard<std::mutex> guard(m_pause_lock);
   m_muted = mute;
 
   if (m_muted)
   {
-    soundTouch.clear();
     alSourceStop(uiSource);
   }
   else
@@ -129,7 +141,11 @@ void OpenALStream::Clear(bool mute)
 
 void OpenALStream::SoundLoop()
 {
-  Common::SetCurrentThreadName("Audio thread - openal");
+  Common::SetCurrentThreadName("SoundStream - OpenAL");
+
+  short realtimeBuffer[OAL_MAX_SAMPLES * STEREO_CHANNELS] = {0};
+  soundtouch::SAMPLETYPE sampleBuffer[OAL_MAX_SAMPLES * SURROUND_CHANNELS] = {0};
+  ALuint uiBuffers[OAL_MAX_BUFFERS] = {0};
 
   bool surround_capable = SConfig::GetInstance().bDPL2Decoder;
 #if defined(__APPLE__)
@@ -141,51 +157,24 @@ void OpenALStream::SoundLoop()
   const ALenum AL_FORMAT_51CHN16 = 0;
 #else
   bool float32_capable = true;
-#endif
-
-  u32 ulFrequency = m_mixer->GetSampleRate();
-  numBuffers = SConfig::GetInstance().iLatency + 2;  // OpenAL requires a minimum of two buffers
-
-  memset(uiBuffers, 0, numBuffers * sizeof(ALuint));
-  uiSource = 0;
 
   // Checks if a X-Fi is being used. If it is, disable FLOAT32 support as this sound card has no
   // support for it even though it reports it does.
   if (strstr(alGetString(AL_RENDERER), "X-Fi"))
     float32_capable = false;
+#endif
+
+  u32 ulFrequency = m_mixer->GetSampleRate();
+  // OpenAL requires a minimum of two buffers
+  unsigned int numBuffers = std::min(OAL_MAX_BUFFERS, SConfig::GetInstance().iLatency + 2);
+  std::unordered_set<ALuint> buffers_active(numBuffers * 2);
+  buffers_active.max_load_factor(0.5f);
 
   // Generate some AL Buffers for streaming
-  alGenBuffers(numBuffers, (ALuint*)uiBuffers);
+  alGenBuffers(numBuffers, uiBuffers);
   // Generate a Source to playback the Buffers
+  uiSource = 0;
   alGenSources(1, &uiSource);
-
-  // Short Silence
-  if (float32_capable)
-    memset(sampleBuffer, 0, OAL_MAX_SAMPLES * numBuffers * FRAME_SURROUND_FLOAT);
-  else
-    memset(sampleBuffer, 0, OAL_MAX_SAMPLES * numBuffers * FRAME_SURROUND_SHORT);
-
-  memset(realtimeBuffer, 0, OAL_MAX_SAMPLES * FRAME_STEREO_SHORT);
-
-  for (int i = 0; i < numBuffers; i++)
-  {
-    if (surround_capable)
-    {
-      if (float32_capable)
-        alBufferData(uiBuffers[i], AL_FORMAT_51CHN32, sampleBuffer, 4 * FRAME_SURROUND_FLOAT,
-                     ulFrequency);
-      else
-        alBufferData(uiBuffers[i], AL_FORMAT_51CHN16, sampleBuffer, 4 * FRAME_SURROUND_SHORT,
-                     ulFrequency);
-    }
-    else
-    {
-      alBufferData(uiBuffers[i], AL_FORMAT_STEREO16, realtimeBuffer, 4 * FRAME_STEREO_SHORT,
-                   ulFrequency);
-    }
-  }
-  alSourceQueueBuffers(uiSource, numBuffers, uiBuffers);
-  alSourcePlay(uiSource);
 
   // Set the default sound volume as saved in the config file.
   alSourcef(uiSource, AL_GAIN, fVolume);
@@ -193,16 +182,32 @@ void OpenALStream::SoundLoop()
   // TODO: Error handling
   // ALenum err = alGetError();
 
-  ALint iBuffersFilled = 0;
-  ALint iBuffersProcessed = 0;
-  ALint iState = 0;
   ALuint uiBufferTemp[OAL_MAX_BUFFERS] = {0};
+  ALint iState = 0;
 
+  soundtouch::SoundTouch soundTouch;
   soundTouch.setChannels(2);
   soundTouch.setSampleRate(ulFrequency);
   soundTouch.setTempo(1.0);
   soundTouch.setSetting(SETTING_USE_QUICKSEEK, 0);
   soundTouch.setSetting(SETTING_USE_AA_FILTER, 0);
+  // SeekWindow = max(SEQUENCE_MS, OVERLAP_MS * 2)
+  // Latency = max(tempo * (SeekWindow - OVERLAP_MS) + OVERLAP_MS, SeekWindow) + SEEKWINDOW_MS
+  // SEQUENCE = 1, SEEKWINDOW = 28, OVERLAP = 12
+  // e.g. Tempo = 2.0, max(2 * (48 - 12) + 12, 48) + 28 = 112ms latency
+  // Tempo = 1.0, max(36, 48) + 28 = 76ms latency
+  // Tempo = 0.5, max(18, 48) + 28 = 76ms latency
+  // Recommended value for Overlap is 8ms.
+  // Recommended value for SeekWindow is 15-25ms.
+  // Minimum value for Sequence is 1ms.
+  // NOTE: All above values are strictly for SoundTouch itself. It doesn't include the
+  //   latency of getting data into an OpenAL buffer, and the OpenAL buffer making it
+  //   through the system to the speakers. Minimum total buffer size seems to be 5ms
+  //   for a fast system to prevent constant underflows with slower systems likely
+  //   needing more. Determining latency from buffer submission to speakers would
+  //   require the user to perform a listening test.
+  //   CMixer doesn't let us query the amount of back-fill in the FIFOs so that's also
+  //   additional untracked latency.
   soundTouch.setSetting(SETTING_SEQUENCE_MS, 1);
   soundTouch.setSetting(SETTING_SEEKWINDOW_MS, 28);
   soundTouch.setSetting(SETTING_OVERLAP_MS, 12);
@@ -210,19 +215,27 @@ void OpenALStream::SoundLoop()
   while (m_run_thread.IsSet())
   {
     // num_samples_to_render in this update - depends on SystemTimers::AUDIO_DMA_PERIOD.
-    const u32 stereo_16_bit_size = 4;
-    const u32 dma_length = 32;
-    const u64 ais_samples_per_second = 48000 * stereo_16_bit_size;
-    u64 audio_dma_period = SystemTimers::GetTicksPerSecond() /
-                           (AudioInterface::GetAIDSampleRate() * stereo_16_bit_size / dma_length);
-    u64 num_samples_to_render =
-        (audio_dma_period * ais_samples_per_second) / SystemTimers::GetTicksPerSecond();
+    static constexpr u32 DMA_LENGTH = 32;
+    static constexpr u32 AIS_SAMPLES_PER_SECOND = 48000;
+    // NOTE: AudioInterface can be changed by the CPU at any time, it doesn't make
+    //   sense to access it from here - the value is invalid the moment after we read it.
+    // NOTE: Value is either 32 (AIDSampleRate = 48000) or 48 (32000).
+    u32 num_samples_to_render =
+        (AIS_SAMPLES_PER_SECOND * DMA_LENGTH) / AudioInterface::GetAIDSampleRate();
 
     unsigned int numSamples = (unsigned int)num_samples_to_render;
     unsigned int minSamples =
-        surround_capable ? 240 : 0;  // DPL2 accepts 240 samples minimum (FWRDURATION)
+        surround_capable ? 240 : 32;  // DPL2 accepts 240 samples minimum (FWRDURATION)
 
     numSamples = (numSamples > OAL_MAX_SAMPLES) ? OAL_MAX_SAMPLES : numSamples;
+    // NOTE: This is a race. The stream tries to pull audio from the mixer at random
+    //   intervals and the mixer has no internal synchronization so we may pull nothing,
+    //   or partial data from FIFOs. i.e. we'll pull AID before the AIS has been written
+    //   causing a desync and increasing the DTK latency, etc. Under the worst case we
+    //   can experience an oscillation where we pull 2ms of AID with 0ms of AIS, then
+    //   2ms of AIS and 0ms of AID resulting in "half-speed" audio that sounds terrible
+    //   because of the mixer's "padding" algorithm inserting a flat tone at a random
+    //   pitch.
     numSamples = m_mixer->Mix(realtimeBuffer, numSamples, false);
 
     // Convert the samples from short to float
@@ -230,54 +243,94 @@ void OpenALStream::SoundLoop()
     for (u32 i = 0; i < numSamples * STEREO_CHANNELS; ++i)
       dest[i] = (float)realtimeBuffer[i] / (1 << 15);
 
-    soundTouch.putSamples(dest, numSamples);
-
-    if (iBuffersProcessed == iBuffersFilled)
+    double rate = m_mixer->GetCurrentSpeed();
+    if (rate <= 0)
     {
-      alGetSourcei(uiSource, AL_BUFFERS_PROCESSED, &iBuffersProcessed);
-      iBuffersFilled = 0;
+      // NOTE: This is asynchronous. It won't be updated until some point later.
+      Core::RequestRefreshInfo();
+      rate = 1;
     }
 
-    if (iBuffersProcessed)
+    // SoundTouch can only operate between -99% and 1000% before it stops functioning
+    // correctly and produces garbage.
+    if (rate < 0.01 || rate > 10)
     {
-      double rate = (double)m_mixer->GetCurrentSpeed();
-      if (rate <= 0)
-      {
-        Core::RequestRefreshInfo();
-        rate = (double)m_mixer->GetCurrentSpeed();
-      }
+      soundTouch.clear();
+      continue;
+    }
+    soundTouch.setTempo(rate);
+    // NOTE: SoundTouch computes output once the buffer reaches the input latency
+    //   threshold (i.e. latency of 72ms means it begins processing when 72ms of
+    //   input audio is queued). Conversion happens in putSamples so all parameters
+    //   must be configured before risking crossing the boundary line.
+    soundTouch.putSamples(dest, numSamples);
 
-      // Place a lower limit of 10% speed.  When a game boots up, there will be
-      // many silence samples.  These do not need to be timestretched.
-      if (rate > 0.10)
+    if (!buffers_active.empty())
+    {
+      int num_buffers_done = 0;
+      alGetSourcei(uiSource, AL_BUFFERS_PROCESSED, &num_buffers_done);
+      if (num_buffers_done)
       {
-        soundTouch.setTempo(rate);
-        if (rate > 10)
+        uiBufferTemp[0] = 0;
+        alSourceUnqueueBuffers(uiSource, num_buffers_done, uiBufferTemp);
+        if (uiBufferTemp[0])
         {
-          soundTouch.clear();
+          for (int i = 0; i < num_buffers_done; ++i)
+          {
+            buffers_active.erase(uiBufferTemp[i]);
+          }
         }
       }
+    }
+    if (buffers_active.size() == numBuffers)
+    {
+      // NOTE: This event is set by AID after it writes data. If AID is disabled
+      //   so only DTK is used then this will never be set; thus, it tells us
+      //   nothing about AIS/DTK. We have no way of knowing when or if the AIS/DTK
+      //   has been written so we get to data race that system and pray it works.
+      soundSyncEvent.Wait();
+      continue;
+    }
 
-      unsigned int nSamples = soundTouch.receiveSamples(sampleBuffer, OAL_MAX_SAMPLES * numBuffers);
-
-      if (nSamples <= minSamples)
-        continue;
-
-      // Remove the Buffer from the Queue.  (uiBuffer contains the Buffer ID for the unqueued
-      // Buffer)
-      if (iBuffersFilled == 0)
+    // If we are 1000ms behind the emulator then just throw everything away.
+    // 1sec latency is too far. This typically happens during boot when the
+    // emulator is running at 1fps while the JIT compiles the first wave of
+    // blocks.
+    if (soundTouch.numSamples() > AIS_SAMPLES_PER_SECOND)
+    {
+      unsigned int samples = soundTouch.numSamples();
+      unsigned int buffer_size_with_rate =
+          static_cast<unsigned int>(numBuffers * OAL_MAX_SAMPLES / rate);
+      if (buffer_size_with_rate < samples)
       {
-        alSourceUnqueueBuffers(uiSource, iBuffersProcessed, uiBufferTemp);
-        ALenum err = alGetError();
-        if (err != 0)
+        soundTouch.receiveSamples(soundTouch.numSamples() - buffer_size_with_rate);
+        WARN_LOG(AUDIO, "Buffer discard: %u -> %u", samples, soundTouch.numSamples());
+      }
+    }
+    else if (soundTouch.numSamples() < minSamples)
+    {
+      // NOTE: Do not try to sleep on soundSyncEvent, it will stall out for too
+      //   long and underflow.
+      continue;
+    }
+
+    while (soundTouch.numSamples() >= minSamples && buffers_active.size() != numBuffers)
+    {
+      unsigned int nSamples = soundTouch.receiveSamples(sampleBuffer, OAL_MAX_SAMPLES);
+
+      ALuint empty_buffer = 0;
+      for (unsigned int i = 0; i < numBuffers; ++i)
+      {
+        if (!buffers_active.count(uiBuffers[i]))
         {
-          ERROR_LOG(AUDIO, "Error unqueuing buffers: %08x", err);
+          empty_buffer = uiBuffers[i];
+          break;
         }
       }
 
       if (surround_capable)
       {
-        float dpl2[OAL_MAX_SAMPLES * OAL_MAX_BUFFERS * SURROUND_CHANNELS];
+        float dpl2[OAL_MAX_SAMPLES * SURROUND_CHANNELS];
         DPL2Decode(sampleBuffer, nSamples, dpl2);
 
         // zero-out the subwoofer channel - DPL2Decode generates a pretty
@@ -291,16 +344,16 @@ void OpenALStream::SoundLoop()
 
         if (float32_capable)
         {
-          alBufferData(uiBufferTemp[iBuffersFilled], AL_FORMAT_51CHN32, dpl2,
-                       nSamples * FRAME_SURROUND_FLOAT, ulFrequency);
+          alBufferData(empty_buffer, AL_FORMAT_51CHN32, dpl2, nSamples * FRAME_SURROUND_FLOAT,
+                       ulFrequency);
         }
         else
         {
-          short surround_short[OAL_MAX_SAMPLES * SURROUND_CHANNELS * OAL_MAX_BUFFERS];
+          short surround_short[OAL_MAX_SAMPLES * SURROUND_CHANNELS];
           for (u32 i = 0; i < nSamples * SURROUND_CHANNELS; ++i)
             surround_short[i] = (short)((float)dpl2[i] * (1 << 15));
 
-          alBufferData(uiBufferTemp[iBuffersFilled], AL_FORMAT_51CHN16, surround_short,
+          alBufferData(empty_buffer, AL_FORMAT_51CHN16, surround_short,
                        nSamples * FRAME_SURROUND_SHORT, ulFrequency);
         }
 
@@ -317,12 +370,11 @@ void OpenALStream::SoundLoop()
           ERROR_LOG(AUDIO, "Error occurred while buffering data: %08x", err);
         }
       }
-
       else
       {
         if (float32_capable)
         {
-          alBufferData(uiBufferTemp[iBuffersFilled], AL_FORMAT_STEREO_FLOAT32, sampleBuffer,
+          alBufferData(empty_buffer, AL_FORMAT_STEREO_FLOAT32, sampleBuffer,
                        nSamples * FRAME_STEREO_FLOAT, ulFrequency);
           ALenum err = alGetError();
           if (err == AL_INVALID_ENUM)
@@ -338,50 +390,56 @@ void OpenALStream::SoundLoop()
         else
         {
           // Convert the samples from float to short
-          short stereo[OAL_MAX_SAMPLES * STEREO_CHANNELS * OAL_MAX_BUFFERS];
+          short stereo[OAL_MAX_SAMPLES * STEREO_CHANNELS];
           for (u32 i = 0; i < nSamples * STEREO_CHANNELS; ++i)
             stereo[i] = (short)((float)sampleBuffer[i] * (1 << 15));
 
-          alBufferData(uiBufferTemp[iBuffersFilled], AL_FORMAT_STEREO16, stereo,
-                       nSamples * FRAME_STEREO_SHORT, ulFrequency);
+          alBufferData(empty_buffer, AL_FORMAT_STEREO16, stereo, nSamples * FRAME_STEREO_SHORT,
+                       ulFrequency);
         }
       }
 
-      alSourceQueueBuffers(uiSource, 1, &uiBufferTemp[iBuffersFilled]);
+      alSourceQueueBuffers(uiSource, 1, &empty_buffer);
       ALenum err = alGetError();
-      if (err != 0)
+      if (err == AL_NO_ERROR)
+      {
+        buffers_active.insert(empty_buffer);
+      }
+      else
       {
         ERROR_LOG(AUDIO, "Error queuing buffers: %08x", err);
       }
-      iBuffersFilled++;
+    }
 
-      if (iBuffersFilled == numBuffers)
+    alGetSourcei(uiSource, AL_SOURCE_STATE, &iState);
+    if (iState != AL_PLAYING)
+    {
+      // Buffer underrun occurred, resume playback
+      std::lock_guard<std::mutex> pause_lock(m_pause_lock);
+      // Wait until ALL buffers are full (i.e. maximum latency attained)
+      // before beginning to play otherwise we'll probably just underflow
+      // again immediately because each individual buffer is really small.
+      if (!m_muted && buffers_active.size() == numBuffers)
       {
         alSourcePlay(uiSource);
-        err = alGetError();
-        if (err != 0)
-        {
-          ERROR_LOG(AUDIO, "Error occurred during playback: %08x", err);
-        }
-      }
-
-      alGetSourcei(uiSource, AL_SOURCE_STATE, &iState);
-      if (iState != AL_PLAYING)
-      {
-        // Buffer underrun occurred, resume playback
-        alSourcePlay(uiSource);
-        err = alGetError();
+        ALenum err = alGetError();
         if (err != 0)
         {
           ERROR_LOG(AUDIO, "Error occurred resuming playback: %08x", err);
         }
       }
     }
-    else
-    {
-      soundSyncEvent.Wait();
-    }
   }
+
+  // Clean up buffers
+  alSourceStop(uiSource);
+  alSourceUnqueueBuffers(uiSource, numBuffers, uiBufferTemp);
+  alSourcei(uiSource, AL_BUFFER, 0);
+  alDeleteBuffers(numBuffers, uiBuffers);
+
+  // Cleanup Source
+  alDeleteSources(1, &uiSource);
+  uiSource = 0;
 }
 
 #endif  // HAVE_OPENAL

@@ -4,9 +4,11 @@
 
 #pragma once
 
+#include <mutex>
 #include <thread>
 
 #include "AudioCommon/SoundStream.h"
+#include "Common/Common.h"
 #include "Common/Event.h"
 #include "Core/Core.h"
 #include "Core/HW/AudioInterface.h"
@@ -25,31 +27,6 @@
 #include <AL/alc.h>
 #include <AL/alext.h>
 #endif
-
-#ifdef __APPLE__
-// Avoid conflict with objc.h (on Windows, ST uses the system BOOL type, so this doesn't work)
-#define BOOL SoundTouch_BOOL
-#endif
-
-#include <soundtouch/STTypes.h>
-#include <soundtouch/SoundTouch.h>
-
-#ifdef __APPLE__
-#undef BOOL
-#endif
-
-// 16 bit Stereo
-#define SFX_MAX_SOURCE 1
-#define OAL_MAX_BUFFERS 32
-#define OAL_MAX_SAMPLES 256
-#define STEREO_CHANNELS 2
-#define SURROUND_CHANNELS 6  // number of channels in surround mode
-#define SIZE_SHORT 2
-#define SIZE_FLOAT 4  // size of a float in bytes
-#define FRAME_STEREO_SHORT STEREO_CHANNELS* SIZE_SHORT
-#define FRAME_STEREO_FLOAT STEREO_CHANNELS* SIZE_FLOAT
-#define FRAME_SURROUND_FLOAT SURROUND_CHANNELS* SIZE_FLOAT
-#define FRAME_SURROUND_SHORT SURROUND_CHANNELS* SIZE_SHORT
 #endif
 
 class OpenALStream final : public SoundStream
@@ -69,14 +46,10 @@ private:
   std::thread thread;
   Common::Flag m_run_thread;
 
+  std::mutex m_pause_lock;
   Common::Event soundSyncEvent;
 
-  short realtimeBuffer[OAL_MAX_SAMPLES * STEREO_CHANNELS];
-  soundtouch::SAMPLETYPE sampleBuffer[OAL_MAX_SAMPLES * SURROUND_CHANNELS * OAL_MAX_BUFFERS];
-  ALuint uiBuffers[OAL_MAX_BUFFERS];
   ALuint uiSource;
   ALfloat fVolume;
-
-  u8 numBuffers;
 #endif  // HAVE_OPENAL
 };
