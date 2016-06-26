@@ -35,7 +35,7 @@ static float adapt_l_gain, adapt_r_gain, adapt_lpr_gain, adapt_lmr_gain;
 static std::vector<float> lf, rf, lr, rr, cf, cr;
 static float LFE_buf[256];
 static unsigned int lfe_pos;
-static float* filter_coefs_lfe;
+static std::vector<float> filter_coefs_lfe;
 static unsigned int len125;
 
 template <class T, class _ftype_t>
@@ -122,7 +122,7 @@ opt   beta constant used only when designing using kaiser windows
 
 returns 0 if OK, -1 if fail
 */
-static float* DesignFIR(unsigned int* n, float* fc, float opt)
+static std::vector<float> DesignFIR(unsigned int* n, float* fc, float opt)
 {
   unsigned int o = *n & 1;                 // Indicator for odd filter length
   unsigned int end = ((*n + 1) >> 1) - o;  // Loop end
@@ -135,14 +135,14 @@ static float* DesignFIR(unsigned int* n, float* fc, float opt)
 
   // Sanity check
   if (*n == 0)
-    return nullptr;
+    return {};
 
   fc[0] = MathUtil::Clamp(fc[0], 0.001f, 1.0f);
 
-  float* w = (float*)calloc(sizeof(float), *n);
+  std::vector<float> w(*n);
 
   // Get window coefficients
-  Hamming(*n, w);
+  Hamming(*n, w.data());
 
   fc1 = *fc;
   // Cutoff frequency must be < 0.5 where 0.5 <=> Fs/2
@@ -196,20 +196,15 @@ static void OnSeek()
 static void Done()
 {
   OnSeek();
-
-  if (filter_coefs_lfe)
-  {
-    free(filter_coefs_lfe);
-  }
-
-  filter_coefs_lfe = nullptr;
+  filter_coefs_lfe.clear();
+  filter_coefs_lfe.shrink_to_fit();
 }
 
-static float* CalculateCoefficients125HzLowpass(int rate)
+static std::vector<float> CalculateCoefficients125HzLowpass(int rate)
 {
   len125 = 256;
   float f = 125.0f / (rate / 2);
-  float* coeffs = DesignFIR(&len125, &f, 0);
+  std::vector<float> coeffs = DesignFIR(&len125, &f, 0);
   static const float M3_01DB = 0.7071067812f;
   for (unsigned int i = 0; i < len125; i++)
   {
@@ -364,7 +359,7 @@ void DPL2Decode(float* samples, int numsamples, float* out)
     out[cur + 1] = rf[k];
     out[cur + 2] = cf[k];
     LFE_buf[lfe_pos] = (lf[k] + rf[k] + 2.0f * cf[k] + lr[k] + rr[k]) / 2.0f;
-    out[cur + 3] = FIRFilter(LFE_buf, lfe_pos, len125, len125, filter_coefs_lfe);
+    out[cur + 3] = FIRFilter(LFE_buf, lfe_pos, len125, len125, filter_coefs_lfe.data());
     lfe_pos++;
     if (lfe_pos == len125)
     {
@@ -387,5 +382,6 @@ void DPL2Reset()
 {
   olddelay = -1;
   oldfreq = 0;
-  filter_coefs_lfe = nullptr;
+  filter_coefs_lfe.clear();
+  filter_coefs_lfe.shrink_to_fit();
 }
