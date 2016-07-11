@@ -42,8 +42,8 @@ void AudioConfigPane::InitializeGUI()
   m_volume_text = new wxStaticText(this, wxID_ANY, "");
   m_audio_backend_choice =
       new wxChoice(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, m_audio_backend_strings);
-  m_audio_latency_spinctrl =
-      new wxSpinCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxSP_ARROW_KEYS, 0, 30);
+  m_audio_latency_spinctrl = new wxSpinCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize,
+                                            wxSP_ARROW_KEYS, 38, 1000);
 
   m_dsp_engine_radiobox->Bind(wxEVT_RADIOBOX, &AudioConfigPane::OnDSPEngineRadioBoxChanged, this);
   m_dpl2_decoder_checkbox->Bind(wxEVT_CHECKBOX, &AudioConfigPane::OnDPL2DecoderCheckBoxChanged,
@@ -126,7 +126,6 @@ void AudioConfigPane::RefreshGUI()
 {
   if (Core::IsRunning())
   {
-    m_audio_latency_spinctrl->Disable();
     m_audio_backend_choice->Disable();
     m_dpl2_decoder_checkbox->Disable();
     m_dsp_engine_radiobox->Disable();
