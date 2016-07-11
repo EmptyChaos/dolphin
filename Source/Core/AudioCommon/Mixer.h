@@ -18,6 +18,9 @@ public:
 
   // Called from audio threads
   unsigned int Mix(short* samples, unsigned int numSamples, bool consider_framelimit = true);
+  unsigned int MixAvailable(short* samples, unsigned int numSamples);  // Ignores framelimit
+  void Resynchronize();  // Discards excess samples from FIFOs that are lagging, ignores framelimit
+  unsigned int GetFIFOLag() const;  // In GetSampleRate() samples, ignores framelimit
 
   // Called from main thread
   void PushSamples(const short* samples, unsigned int num_samples);
@@ -54,13 +57,16 @@ private:
     }
     void PushSamples(const short* samples, unsigned int num_samples);
     unsigned int Mix(short* samples, unsigned int numSamples, bool consider_framelimit = true);
+    void Purge(unsigned int amount);
+    void Purge();
+    unsigned int AvailableSamples() const;
     void SetInputSampleRate(unsigned int rate);
     unsigned int GetInputSampleRate() const;
     void SetVolume(unsigned int lvolume, unsigned int rvolume);
 
   private:
     CMixer* m_mixer;
-    unsigned m_input_sample_rate;
+    unsigned int m_input_sample_rate;
     std::array<short, MAX_SAMPLES * 2> m_buffer{};
     std::atomic<u32> m_indexW{0};
     std::atomic<u32> m_indexR{0};
