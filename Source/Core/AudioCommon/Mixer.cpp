@@ -100,19 +100,21 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
   {
     u32 indexR2 = indexR + 2;  // next sample
 
+    // NOTE: Input is in Right-Left order. Output must be Left-Right.
+    //   This makes things somewhat confusing as Channel0 is Right, not Left.
     s16 l1 = Common::swap16(m_buffer[indexR & INDEX_MASK]);   // current
     s16 l2 = Common::swap16(m_buffer[indexR2 & INDEX_MASK]);  // next
-    int sampleL = ((l1 << 16) + (l2 - l1) * (u16)m_frac) >> 16;
-    sampleL = (sampleL * m_ss_left_volume) >> 8;
-    sampleL += samples[currentSample + 1];
-    samples[currentSample + 1] = MathUtil::Clamp(sampleL, -32767, 32767);
+    int sampleR = ((l1 << 16) + (l2 - l1) * (u16)m_frac) >> 16;
+    sampleR = (sampleR * m_ss_channel0_volume) >> 8;
+    sampleR += samples[currentSample + 1];
+    samples[currentSample + 1] = MathUtil::Clamp(sampleR, -32767, 32767);
 
     s16 r1 = Common::swap16(m_buffer[(indexR + 1) & INDEX_MASK]);   // current
     s16 r2 = Common::swap16(m_buffer[(indexR2 + 1) & INDEX_MASK]);  // next
-    int sampleR = ((r1 << 16) + (r2 - r1) * (u16)m_frac) >> 16;
-    sampleR = (sampleR * m_ss_right_volume) >> 8;
-    sampleR += samples[currentSample];
-    samples[currentSample] = MathUtil::Clamp(sampleR, -32767, 32767);
+    int sampleL = ((r1 << 16) + (r2 - r1) * (u16)m_frac) >> 16;
+    sampleL = (sampleL * m_ss_channel1_volume) >> 8;
+    sampleL += samples[currentSample];
+    samples[currentSample] = MathUtil::Clamp(sampleL, -32767, 32767);
 
     m_frac += ratio;
     indexR += 2 * (u16)(m_frac >> 16);
@@ -120,11 +122,12 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
   }
 
   // Prepare the padding samples before we release control of the ring buffer.
-  short pad_samples[2];
-  pad_samples[0] = Common::swap16(m_buffer[(indexR - 1) & INDEX_MASK]);
-  pad_samples[1] = Common::swap16(m_buffer[(indexR - 2) & INDEX_MASK]);
-  pad_samples[0] = (pad_samples[0] * m_ss_right_volume) >> 8;
-  pad_samples[1] = (pad_samples[1] * m_ss_left_volume) >> 8;
+  // We are pre-swapping the order (Channel 1->0, 0->1)
+  int pad_samples[2];
+  pad_samples[0] = static_cast<s16>(Common::swap16(m_buffer[(indexR - 1) & INDEX_MASK]));
+  pad_samples[1] = static_cast<s16>(Common::swap16(m_buffer[(indexR - 2) & INDEX_MASK]));
+  pad_samples[0] = (pad_samples[0] * m_ss_channel1_volume) >> 8;
+  pad_samples[1] = (pad_samples[1] * m_ss_channel0_volume) >> 8;
 
   // Flush cached variable
   // Memory Order: We need release ordering here so that index updates strictly
@@ -139,8 +142,8 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
   if (raw_indexW != indexW && indexW - indexR <= 2)
   {
     const ControlMessage& pkt = m_control_messages.Front();
-    m_ss_left_volume = pkt.left_volume;
-    m_ss_right_volume = pkt.right_volume;
+    m_ss_channel0_volume = pkt.channel0_volume;
+    m_ss_channel1_volume = pkt.channel1_volume;
     m_ss_sample_rate = pkt.sample_rate;
     m_control_messages.Pop();
 
@@ -153,13 +156,10 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
   }
 
   // Padding
-  for (; currentSample < numSamples * 2; currentSample += 2)
+  for (; currentSample < numSamples * 2; ++currentSample)
   {
-    int sampleR = MathUtil::Clamp(pad_samples[0] + samples[currentSample + 0], -32767, 32767);
-    int sampleL = MathUtil::Clamp(pad_samples[1] + samples[currentSample + 1], -32767, 32767);
-
-    samples[currentSample + 0] = sampleR;
-    samples[currentSample + 1] = sampleL;
+    samples[currentSample] =
+        MathUtil::Clamp(samples[currentSample] + pad_samples[currentSample & 1], -32768, 32767);
   }
 
   return frames_written;
@@ -176,8 +176,8 @@ bool CMixer::MixerFifo::UpdateControl()
   if (msg.attached_index - read_idx > 4)
     return false;
 
-  m_ss_left_volume = msg.left_volume;
-  m_ss_right_volume = msg.right_volume;
+  m_ss_channel0_volume = msg.channel0_volume;
+  m_ss_channel1_volume = msg.channel1_volume;
   m_ss_sample_rate = msg.sample_rate;
   m_control_messages.Pop();
   return true;
@@ -279,7 +279,7 @@ void CMixer::MixerFifo::PushSamples(const short* samples, unsigned int num_sampl
   if (m_cpu_pending_message)
   {
     m_control_messages.Push(
-        ControlMessage{indexW, m_cpu_left_volume, m_cpu_right_volume, m_cpu_sample_rate});
+        ControlMessage{indexW, m_cpu_channel0_volume, m_cpu_channel1_volume, m_cpu_sample_rate});
     m_cpu_pending_message = false;
   }
 
@@ -331,14 +331,14 @@ void CMixer::SetStreamInputSampleRate(unsigned int rate)
   m_streaming_mixer.SetInputSampleRate(rate);
 }
 
-void CMixer::SetStreamingVolume(unsigned int lvolume, unsigned int rvolume)
+void CMixer::SetStreamingVolume(unsigned int vol0, unsigned int vol1)
 {
-  m_streaming_mixer.SetVolume(lvolume, rvolume);
+  m_streaming_mixer.SetVolume(vol0, vol1);
 }
 
-void CMixer::SetWiimoteSpeakerVolume(unsigned int lvolume, unsigned int rvolume)
+void CMixer::SetWiimoteSpeakerVolume(unsigned int vol0, unsigned int vol1)
 {
-  m_wiimote_speaker_mixer.SetVolume(lvolume, rvolume);
+  m_wiimote_speaker_mixer.SetVolume(vol0, vol1);
 }
 
 void CMixer::StartLogDTKAudio(const std::string& filename)
@@ -408,14 +408,14 @@ void CMixer::MixerFifo::SetInputSampleRate(unsigned int rate)
   m_cpu_pending_message = true;
 }
 
-void CMixer::MixerFifo::SetVolume(unsigned int lvolume, unsigned int rvolume)
+void CMixer::MixerFifo::SetVolume(unsigned int vol0, unsigned int vol1)
 {
-  lvolume += (lvolume >> 7);
-  rvolume += (rvolume >> 7);
-  if (lvolume == m_cpu_left_volume && rvolume == m_cpu_right_volume)
+  vol0 += (vol0 >> 7);
+  vol1 += (vol1 >> 7);
+  if (vol0 == m_cpu_channel0_volume && vol1 == m_cpu_channel1_volume)
     return;
 
-  m_cpu_left_volume = lvolume;
-  m_cpu_right_volume = rvolume;
+  m_cpu_channel0_volume = vol0;
+  m_cpu_channel1_volume = vol1;
   m_cpu_pending_message = true;
 }

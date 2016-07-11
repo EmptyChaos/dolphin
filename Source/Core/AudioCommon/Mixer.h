@@ -29,8 +29,8 @@ public:
   unsigned int GetSampleRate() const { return m_sampleRate; }
   void SetDMAInputSampleRate(unsigned int rate);
   void SetStreamInputSampleRate(unsigned int rate);
-  void SetStreamingVolume(unsigned int lvolume, unsigned int rvolume);
-  void SetWiimoteSpeakerVolume(unsigned int lvolume, unsigned int rvolume);
+  void SetStreamingVolume(unsigned int vol0, unsigned int vol1);
+  void SetWiimoteSpeakerVolume(unsigned int vol0, unsigned int vol1);
 
   void StartLogDTKAudio(const std::string& filename);
   void StopLogDTKAudio();
@@ -59,7 +59,7 @@ private:
     void SetInputSampleRate(unsigned int rate);
     unsigned int GetInputSampleRateSoundStream() const { return m_ss_sample_rate; }
     unsigned int GetInputSampleRateCPU() const { return m_cpu_sample_rate; }
-    void SetVolume(unsigned int lvolume, unsigned int rvolume);
+    void SetVolume(unsigned int vol0, unsigned int vol1);
 
   private:
     struct ControlMessage
@@ -67,8 +67,8 @@ private:
       // Ring Buffer coordinate where the message needs to be processed.
       u32 attached_index;
 
-      s32 left_volume;
-      s32 right_volume;
+      s32 channel0_volume;
+      s32 channel1_volume;
       unsigned int sample_rate;
     };
 
@@ -79,14 +79,14 @@ private:
     // Volume ranges from 0-256
     // SoundStream side
     unsigned int m_ss_sample_rate;
-    s32 m_ss_left_volume{256};
-    s32 m_ss_right_volume{256};
+    s32 m_ss_channel0_volume{256}; // Right
+    s32 m_ss_channel1_volume{256}; // Left
     float m_numLeftI = 0.0f;
     u32 m_frac = 0;
 
     // CPU side
-    s32 m_cpu_left_volume{256};
-    s32 m_cpu_right_volume{256};
+    s32 m_cpu_channel0_volume{256}; // Right
+    s32 m_cpu_channel1_volume{256}; // Left
     unsigned int m_cpu_sample_rate;
     bool m_cpu_pending_message{false};
 
