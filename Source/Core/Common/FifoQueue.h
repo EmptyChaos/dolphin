@@ -7,56 +7,73 @@
 // a simple lockless thread-safe,
 // single reader, single writer queue
 
-#include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <utility>
 
 #include "Common/CommonTypes.h"
 
 namespace Common
 {
-template <typename T, bool NeedSize = true>
-class FifoQueue
+namespace Details
+{
+template <bool Enabled>
+class FifoQueueSizeStrategy
+{
+protected:
+  void IncrementSize() {}
+  void DecrementSize() {}
+  void ResetSize() {}
+};
+
+template <>
+class FifoQueueSizeStrategy<true>
 {
 public:
-  FifoQueue() : m_size(0) { m_write_ptr = m_read_ptr = new ElementPtr(); }
+  u32 Size() const { return m_size.load(std::memory_order_acquire); }
+protected:
+  void IncrementSize() { m_size.fetch_add(1, std::memory_order_release); }
+  void DecrementSize() { m_size.fetch_sub(1, std::memory_order_release); }
+  void ResetSize() { m_size.store(0, std::memory_order_relaxed); }
+private:
+  std::atomic<u32> m_size{0};
+};
+}
+
+template <typename T, bool NeedSize = true>
+class FifoQueue : public Details::FifoQueueSizeStrategy<NeedSize>
+{
+public:
+  FifoQueue() { m_write_ptr = m_read_ptr = new Element(); }
+  FifoQueue(const FifoQueue&) = delete;
   ~FifoQueue()
   {
-    // this will empty out the whole queue
+    Clear();
     delete m_read_ptr;
   }
+  FifoQueue& operator=(const FifoQueue&) = delete;
 
-  u32 Size() const
-  {
-    static_assert(NeedSize, "using Size() on FifoQueue without NeedSize");
-    return m_size.load();
-  }
-
-  bool Empty() const { return !m_read_ptr->next.load(); }
+  bool Empty() const { return !m_read_ptr->next.load(std::memory_order_acquire); }
   T& Front() const { return m_read_ptr->current; }
-  template <typename Arg>
-  void Push(Arg&& t)
+  void Push(const T& t) { Push(T(t)); }
+  void Push(T&& t)
   {
     // create the element, add it to the queue
-    m_write_ptr->current = std::forward<Arg>(t);
+    m_write_ptr->current = std::move(t);
     // set the next pointer to a new element ptr
     // then advance the write pointer
-    ElementPtr* new_ptr = new ElementPtr();
+    Element* new_ptr = new Element();
     m_write_ptr->next.store(new_ptr, std::memory_order_release);
     m_write_ptr = new_ptr;
-    if (NeedSize)
-      m_size++;
+    IncrementSize();
   }
 
   void Pop()
   {
-    if (NeedSize)
-      m_size--;
-    ElementPtr* tmpptr = m_read_ptr;
+    DecrementSize();
+    Element* tmpptr = m_read_ptr;
     // advance the read pointer
-    m_read_ptr = tmpptr->next.load();
-    // set the next element to nullptr to stop the recursive deletion
-    tmpptr->next.store(nullptr);
+    m_read_ptr = tmpptr->next.load(std::memory_order_acquire);
     delete tmpptr;  // this also deletes the element
   }
 
@@ -65,46 +82,35 @@ public:
     if (Empty())
       return false;
 
-    if (NeedSize)
-      m_size--;
-
-    ElementPtr* tmpptr = m_read_ptr;
-    m_read_ptr = tmpptr->next.load(std::memory_order_acquire);
-    t = std::move(tmpptr->current);
-    tmpptr->next.store(nullptr);
-    delete tmpptr;
+    t = std::move(m_read_ptr->current);
+    Pop();
     return true;
   }
 
-  // not thread-safe
+  // consumer side only
   void Clear()
   {
-    m_size.store(0);
-    delete m_read_ptr;
-    m_write_ptr = m_read_ptr = new ElementPtr();
+    while (true)
+    {
+      Element* next = m_read_ptr->next.load(std::memory_order_acquire);
+      if (!next)
+        break;
+      delete m_read_ptr;
+      m_read_ptr = next;
+      DecrementSize();
+    }
   }
 
 private:
   // stores a pointer to element
-  // and a pointer to the next ElementPtr
-  class ElementPtr
+  // and a pointer to the next Element
+  struct Element
   {
-  public:
-    ElementPtr() : next(nullptr) {}
-    ~ElementPtr()
-    {
-      ElementPtr* next_ptr = next.load();
-
-      if (next_ptr)
-        delete next_ptr;
-    }
-
+    std::atomic<Element*> next{nullptr};
     T current;
-    std::atomic<ElementPtr*> next;
   };
 
-  ElementPtr* m_write_ptr;
-  ElementPtr* m_read_ptr;
-  std::atomic<u32> m_size;
+  Element* m_write_ptr;
+  Element* m_read_ptr;
 };
 }

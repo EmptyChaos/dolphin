@@ -23,9 +23,12 @@ CMixer::~CMixer()
 unsigned int CMixer::MixerFifo::AvailableSamples() const
 {
   u32 read_idx = m_indexR.load(std::memory_order_relaxed);
-  u32 write_idx = m_indexW.load(std::memory_order_relaxed);
+  u32 write_idx = m_indexW.load(std::memory_order_acquire);  // Acquire m_control_messages
 
-  double ratio = static_cast<double>(m_mixer->GetSampleRate()) / m_input_sample_rate;
+  double ratio = static_cast<double>(m_mixer->GetSampleRate()) / m_ss_sample_rate;
+
+  u32 stop_point =
+      m_control_messages.Empty() ? write_idx : m_control_messages.Front().attached_index;
 
   // The Mix function has a latency of 1 sample so we need to subtract one from the
   // distance. m_frac is the fixed point offset between the 1 latency sample and the
@@ -33,7 +36,7 @@ unsigned int CMixer::MixerFifo::AvailableSamples() const
   // determine the amount left; we would rather undershoot than overshoot since
   // overshooting means we end up with padding garbage, undershooting just means
   // we have 1-2 samples of additional latency.
-  unsigned int distance = std::max<u32>((write_idx - read_idx) / 2, 1) - 1;
+  unsigned int distance = std::max<u32>((stop_point - read_idx) / 2, 1) - 1;
   return distance ?
              static_cast<unsigned int>(ratio * (distance - m_frac / static_cast<double>(1 << 16))) :
              0;
@@ -53,17 +56,21 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
   // Without this cache, the compiler wouldn't be allowed to optimize the
   // interpolation loop.
   u32 indexR = m_indexR.load(std::memory_order_relaxed);
-  u32 indexW = m_indexW.load(std::memory_order_acquire);  // acquire m_buffer
+  u32 raw_indexW = m_indexW.load(std::memory_order_acquire);  // acquire m_buffer
 
   // If the pipe is empty then skip everything. The only thing that will happen is
   // that we'll fill the buffer with padding samples which is usually bad.
-  if (indexW - indexR <= 2)
+  if (raw_indexW - indexR <= 2)
     return 0;
 
-  u32 ratio = static_cast<u32>(m_input_sample_rate * UINT64_C(65536) / m_mixer->GetSampleRate());
+  // If there's a control message pending then we can only process up to that position
+  // before we have to stop and apply the changes.
+  u32 indexW = m_control_messages.Empty() ? raw_indexW : m_control_messages.Front().attached_index;
+
+  u32 ratio = static_cast<u32>(m_ss_sample_rate * UINT64_C(65536) / m_mixer->GetSampleRate());
   if (consider_framelimit)
   {
-    u32 low_waterwark = m_input_sample_rate * SConfig::GetInstance().iTimingVariance / 1000;
+    u32 low_waterwark = m_ss_sample_rate * SConfig::GetInstance().iTimingVariance / 1000;
     low_waterwark = std::min(low_waterwark, MAX_SAMPLES / 2);
 
     float numLeft = static_cast<float>((indexW - indexR) / 2);
@@ -75,7 +82,7 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
       offset = -MAX_FREQ_SHIFT;
 
     float emulationspeed = SConfig::GetInstance().m_EmulationSpeed;
-    float aid_sample_rate = m_input_sample_rate + offset;
+    float aid_sample_rate = m_ss_sample_rate + offset;
     if (emulationspeed > 0.0f)
     {
       aid_sample_rate = aid_sample_rate * emulationspeed;
@@ -83,9 +90,6 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
 
     ratio = static_cast<u32>(65536.f * aid_sample_rate / m_mixer->GetSampleRate());
   }
-
-  s32 lvolume = m_LVolume.load(std::memory_order_relaxed);
-  s32 rvolume = m_RVolume.load(std::memory_order_relaxed);
 
   // render numleft sample pairs to samples[]
   // advance indexR with sample position
@@ -99,14 +103,14 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
     s16 l1 = Common::swap16(m_buffer[indexR & INDEX_MASK]);   // current
     s16 l2 = Common::swap16(m_buffer[indexR2 & INDEX_MASK]);  // next
     int sampleL = ((l1 << 16) + (l2 - l1) * (u16)m_frac) >> 16;
-    sampleL = (sampleL * lvolume) >> 8;
+    sampleL = (sampleL * m_ss_left_volume) >> 8;
     sampleL += samples[currentSample + 1];
     samples[currentSample + 1] = MathUtil::Clamp(sampleL, -32767, 32767);
 
     s16 r1 = Common::swap16(m_buffer[(indexR + 1) & INDEX_MASK]);   // current
     s16 r2 = Common::swap16(m_buffer[(indexR2 + 1) & INDEX_MASK]);  // next
     int sampleR = ((r1 << 16) + (r2 - r1) * (u16)m_frac) >> 16;
-    sampleR = (sampleR * rvolume) >> 8;
+    sampleR = (sampleR * m_ss_right_volume) >> 8;
     sampleR += samples[currentSample];
     samples[currentSample] = MathUtil::Clamp(sampleR, -32767, 32767);
 
@@ -115,22 +119,12 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
     m_frac &= 0xffff;
   }
 
-  unsigned int frames_written = currentSample / 2;
-
-  // Padding
-  short s[2];
-  s[0] = Common::swap16(m_buffer[(indexR - 1) & INDEX_MASK]);
-  s[1] = Common::swap16(m_buffer[(indexR - 2) & INDEX_MASK]);
-  s[0] = (s[0] * rvolume) >> 8;
-  s[1] = (s[1] * lvolume) >> 8;
-  for (; currentSample < numSamples * 2; currentSample += 2)
-  {
-    int sampleR = MathUtil::Clamp(s[0] + samples[currentSample + 0], -32767, 32767);
-    int sampleL = MathUtil::Clamp(s[1] + samples[currentSample + 1], -32767, 32767);
-
-    samples[currentSample + 0] = sampleR;
-    samples[currentSample + 1] = sampleL;
-  }
+  // Prepare the padding samples before we release control of the ring buffer.
+  short pad_samples[2];
+  pad_samples[0] = Common::swap16(m_buffer[(indexR - 1) & INDEX_MASK]);
+  pad_samples[1] = Common::swap16(m_buffer[(indexR - 2) & INDEX_MASK]);
+  pad_samples[0] = (pad_samples[0] * m_ss_right_volume) >> 8;
+  pad_samples[1] = (pad_samples[1] * m_ss_left_volume) >> 8;
 
   // Flush cached variable
   // Memory Order: We need release ordering here so that index updates strictly
@@ -138,27 +132,55 @@ unsigned int CMixer::MixerFifo::Mix(short* samples, unsigned int numSamples,
   //   arbitrary point decided by CPU/Compiler reordering.
   m_indexR.store(indexR, std::memory_order_release);
 
+  unsigned int frames_written = currentSample / 2;
+
+  // If there was a message and we are at the point stated in the message
+  // then apply the state changes.
+  if (raw_indexW != indexW && indexW - indexR <= 2)
+  {
+    const ControlMessage& pkt = m_control_messages.Front();
+    m_ss_left_volume = pkt.left_volume;
+    m_ss_right_volume = pkt.right_volume;
+    m_ss_sample_rate = pkt.sample_rate;
+    m_control_messages.Pop();
+
+    // If we need to supply more audio to our caller then we will be forced
+    // to recurse and try again. This is simpler than creating a wrapper loop
+    // which is almost never going to be used anyway.
+    if (frames_written < numSamples)
+      return frames_written +
+             Mix(&samples[currentSample], numSamples - frames_written, consider_framelimit);
+  }
+
+  // Padding
+  for (; currentSample < numSamples * 2; currentSample += 2)
+  {
+    int sampleR = MathUtil::Clamp(pad_samples[0] + samples[currentSample + 0], -32767, 32767);
+    int sampleL = MathUtil::Clamp(pad_samples[1] + samples[currentSample + 1], -32767, 32767);
+
+    samples[currentSample + 0] = sampleR;
+    samples[currentSample + 1] = sampleL;
+  }
+
   return frames_written;
 }
 
-void CMixer::MixerFifo::Purge(unsigned int amount)
+bool CMixer::MixerFifo::UpdateControl()
 {
-  static constexpr unsigned int CHUNK_SIZE = 512;
-  short buffer[CHUNK_SIZE];
-  while (amount)
-  {
-    unsigned int cycle = std::min(amount, CHUNK_SIZE / 2);
-    if (Mix(buffer, cycle, false) < cycle)
-      break;
-    amount -= cycle;
-  }
-}
+  if (m_control_messages.Empty())
+    return false;
 
-void CMixer::MixerFifo::Purge()
-{
-  m_indexR.store(m_indexW.load(std::memory_order_relaxed), std::memory_order_relaxed);
-  m_numLeftI = 0.f;
-  m_frac = 0;
+  const ControlMessage& msg = m_control_messages.Front();
+  u32 read_idx = m_indexR.load(std::memory_order_relaxed);
+  // 4 instead of 2 because of the resampler latency RoundUp((1 + m_frac) * 2)
+  if (msg.attached_index - read_idx > 4)
+    return false;
+
+  m_ss_left_volume = msg.left_volume;
+  m_ss_right_volume = msg.right_volume;
+  m_ss_sample_rate = msg.sample_rate;
+  m_control_messages.Pop();
+  return true;
 }
 
 unsigned int CMixer::Mix(short* samples, unsigned int num_samples, bool consider_framelimit)
@@ -179,8 +201,6 @@ unsigned int CMixer::MixAvailable(short* samples, unsigned int num_samples)
   if (!samples || !num_samples)
     return 0;
 
-  std::fill_n(samples, num_samples * 2, 0);
-
   // Find out how many samples we have available and pull that many at most.
   // The primary condition we have to deal with is a race between DMA and DTK
   // where we try to mix after the DMA has been written but before the DTK
@@ -189,11 +209,16 @@ unsigned int CMixer::MixAvailable(short* samples, unsigned int num_samples)
   // FIFOs are always written by the CPU, it writes silence if it has nothing
   // else to put in it so we can safely rely on these 2 FIFOs to run in
   // lock-step reliably as long as we force synchronization here]
-  // NOTE: A desync can happen if the input sample rate on the FIFOs are
-  //   changed. This requires a Resynchronize() to fix.
-  unsigned int dma_available = m_dma_mixer.AvailableSamples();
-  unsigned int dtk_available = m_streaming_mixer.AvailableSamples();
-  unsigned int fetch_size = std::min({num_samples, dma_available, dtk_available});
+  unsigned int fetch_size = 0;
+  do
+  {
+    unsigned int dma_available = m_dma_mixer.AvailableSamples();
+    unsigned int dtk_available = m_streaming_mixer.AvailableSamples();
+    fetch_size = std::min({num_samples, dma_available, dtk_available});
+    // NOTE: Bitwise-OR is intentional, we always want to run both functions.
+  } while (!fetch_size && (m_dma_mixer.UpdateControl() | m_streaming_mixer.UpdateControl()));
+
+  std::fill_n(samples, num_samples * 2, 0);
   if (!fetch_size)
     return 0;
 
@@ -201,40 +226,6 @@ unsigned int CMixer::MixAvailable(short* samples, unsigned int num_samples)
   m_streaming_mixer.Mix(samples, fetch_size, false);
   m_wiimote_speaker_mixer.Mix(samples, fetch_size, false);
   return fetch_size;
-}
-
-void CMixer::Resynchronize()
-{
-  // Threshold is so we don't purge audio which doesn't need to resynchronized
-  // because we're mid-CPU cycle and it hasn't updated one of the FIFOs yet.
-  // NOTE: DTK is written in 3.5ms chunks. DMA is written in 8 sample chunks.
-  //   This inter-system knowledge is unfortunate but would require embedding
-  //   timing information in the audio stream to work without it.
-  const unsigned int THRESHOLD = m_sampleRate * 4 / 1000;  // 4ms of samples
-  unsigned int dma_available = m_dma_mixer.AvailableSamples();
-  unsigned int dtk_available = m_streaming_mixer.AvailableSamples();
-
-  if (dma_available > dtk_available + THRESHOLD)
-  {
-    m_dma_mixer.Purge(dma_available - dtk_available - THRESHOLD);
-    m_wiimote_speaker_mixer.Purge();
-  }
-  else if (dma_available + THRESHOLD < dtk_available)
-  {
-    m_streaming_mixer.Purge(dtk_available - dma_available - THRESHOLD);
-    m_wiimote_speaker_mixer.Purge();
-  }
-}
-
-unsigned int CMixer::GetFIFOLag() const
-{
-  // FIFO Lag is usually caused by the CPU Thread changing sample rates to a lower one
-  // i.e. 48000 -> 32000. This leaves us with 16000 or so samples which will be played
-  // back at 2/3 speed acting as 500ms of lag.
-  // SoundStreams that care about this lag can fix it by calling Resynchronize().
-  unsigned int dma_available = m_dma_mixer.AvailableSamples();
-  unsigned int dtk_available = m_streaming_mixer.AvailableSamples();
-  return std::max(dma_available, dtk_available) - std::min(dma_available, dtk_available);
 }
 
 void CMixer::MixerFifo::PushSamples(const short* samples, unsigned int num_samples)
@@ -255,6 +246,11 @@ void CMixer::MixerFifo::PushSamples(const short* samples, unsigned int num_sampl
   //     |   |   indexW
   //     |   distance_samples
   //     indexR
+  // IMPORTANT: It's possible to get (indexW & INDEX_MASK) == (indexR & INDEX_MASK)
+  //   where indexW != indexR. i.e. indexW - indexR == BUFFER_SIZE. This is unusual
+  //   for most ring buffer implementations, it's possible here because the cursors
+  //   are much wider than needed to store an index so the extra bits can be used to
+  //   disambiguate the overlapping cursor positions.
   static constexpr unsigned int BUFFER_SIZE = std::tuple_size<decltype(m_buffer)>::value;
   unsigned int remaining_samples = BUFFER_SIZE - (indexW & INDEX_MASK);
   unsigned int distance_samples = indexW - indexR;
@@ -280,13 +276,20 @@ void CMixer::MixerFifo::PushSamples(const short* samples, unsigned int num_sampl
     std::copy(samples + remaining_samples, samples + num_samples, m_buffer.begin());
   }
 
+  if (m_cpu_pending_message)
+  {
+    m_control_messages.Push(
+        ControlMessage{indexW, m_cpu_left_volume, m_cpu_right_volume, m_cpu_sample_rate});
+    m_cpu_pending_message = false;
+  }
+
   m_indexW.store(indexW + num_samples, std::memory_order_release);  // release m_buffer
 }
 
 void CMixer::PushSamples(const short* samples, unsigned int num_samples)
 {
   m_dma_mixer.PushSamples(samples, num_samples);
-  int sample_rate = m_dma_mixer.GetInputSampleRate();
+  int sample_rate = m_dma_mixer.GetInputSampleRateCPU();
   if (m_log_dsp_audio)
     m_wave_writer_dsp.AddStereoSamplesBE(samples, num_samples, sample_rate);
 }
@@ -294,7 +297,7 @@ void CMixer::PushSamples(const short* samples, unsigned int num_samples)
 void CMixer::PushStreamingSamples(const short* samples, unsigned int num_samples)
 {
   m_streaming_mixer.PushSamples(samples, num_samples);
-  int sample_rate = m_streaming_mixer.GetInputSampleRate();
+  int sample_rate = m_streaming_mixer.GetInputSampleRateCPU();
   if (m_log_dtk_audio)
     m_wave_writer_dtk.AddStereoSamplesBE(samples, num_samples, sample_rate);
 }
@@ -343,7 +346,7 @@ void CMixer::StartLogDTKAudio(const std::string& filename)
   if (!m_log_dtk_audio)
   {
     m_log_dtk_audio = true;
-    m_wave_writer_dtk.Start(filename, m_streaming_mixer.GetInputSampleRate());
+    m_wave_writer_dtk.Start(filename, m_streaming_mixer.GetInputSampleRateCPU());
     m_wave_writer_dtk.SetSkipSilence(false);
     NOTICE_LOG(AUDIO, "Starting DTK Audio logging");
   }
@@ -372,7 +375,7 @@ void CMixer::StartLogDSPAudio(const std::string& filename)
   if (!m_log_dsp_audio)
   {
     m_log_dsp_audio = true;
-    m_wave_writer_dsp.Start(filename, m_dma_mixer.GetInputSampleRate());
+    m_wave_writer_dsp.Start(filename, m_dma_mixer.GetInputSampleRateCPU());
     m_wave_writer_dsp.SetSkipSilence(false);
     NOTICE_LOG(AUDIO, "Starting DSP Audio logging");
   }
@@ -398,28 +401,21 @@ void CMixer::StopLogDSPAudio()
 
 void CMixer::MixerFifo::SetInputSampleRate(unsigned int rate)
 {
-  // Any existing samples are now invalidated because the sample rate is wrong.
-  // Ideally we would actually synchronize the sound stream by inserting the
-  // sample rate change into the FIFO as a message so that existing audio can
-  // continue to be processed correctly until it catches up but that requires a
-  // rewrite.
-  m_input_sample_rate = rate;
-}
+  if (rate == m_cpu_sample_rate)
+    return;
 
-unsigned int CMixer::MixerFifo::GetInputSampleRate() const
-{
-  return m_input_sample_rate;
+  m_cpu_sample_rate = rate;
+  m_cpu_pending_message = true;
 }
 
 void CMixer::MixerFifo::SetVolume(unsigned int lvolume, unsigned int rvolume)
 {
-  // Memory Order: We don't want to use a lock so there's no sane order here.
-  //   Even if we use acquire/release/seq_cst, that only guarantees that the
-  //   SoundStream would see "as new or newer", never an exact pair.
-  // Ultimately it doesn't matter because nothing about this is synchronized;
-  // we have no idea what SoundStream is doing, it may be 40ms behind the CPU
-  // so we're altering the volume of an arbitrary track that may be different
-  // than intended.
-  m_LVolume.store(lvolume + (lvolume >> 7), std::memory_order_relaxed);
-  m_RVolume.store(rvolume + (rvolume >> 7), std::memory_order_relaxed);
+  lvolume += (lvolume >> 7);
+  rvolume += (rvolume >> 7);
+  if (lvolume == m_cpu_left_volume && rvolume == m_cpu_right_volume)
+    return;
+
+  m_cpu_left_volume = lvolume;
+  m_cpu_right_volume = rvolume;
+  m_cpu_pending_message = true;
 }

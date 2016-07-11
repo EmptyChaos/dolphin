@@ -9,6 +9,7 @@
 
 #include "AudioCommon/WaveFile.h"
 #include "Common/CommonTypes.h"
+#include "Common/FifoQueue.h"
 
 class CMixer final
 {
@@ -19,8 +20,6 @@ public:
   // Called from audio threads
   unsigned int Mix(short* samples, unsigned int numSamples, bool consider_framelimit = true);
   unsigned int MixAvailable(short* samples, unsigned int numSamples);  // Ignores framelimit
-  void Resynchronize();  // Discards excess samples from FIFOs that are lagging, ignores framelimit
-  unsigned int GetFIFOLag() const;  // In GetSampleRate() samples, ignores framelimit
 
   // Called from main thread
   void PushSamples(const short* samples, unsigned int num_samples);
@@ -50,29 +49,50 @@ private:
   {
   public:
     MixerFifo(CMixer* mixer, unsigned sample_rate)
-        : m_mixer(mixer), m_input_sample_rate(sample_rate)
+        : m_mixer(mixer), m_cpu_sample_rate(sample_rate), m_ss_sample_rate(sample_rate)
     {
     }
     void PushSamples(const short* samples, unsigned int num_samples);
     unsigned int Mix(short* samples, unsigned int numSamples, bool consider_framelimit = true);
-    void Purge(unsigned int amount);
-    void Purge();
+    bool UpdateControl();
     unsigned int AvailableSamples() const;
     void SetInputSampleRate(unsigned int rate);
-    unsigned int GetInputSampleRate() const;
+    unsigned int GetInputSampleRateSoundStream() const { return m_ss_sample_rate; }
+    unsigned int GetInputSampleRateCPU() const { return m_cpu_sample_rate; }
     void SetVolume(unsigned int lvolume, unsigned int rvolume);
 
   private:
+    struct ControlMessage
+    {
+      // Ring Buffer coordinate where the message needs to be processed.
+      u32 attached_index;
+
+      s32 left_volume;
+      s32 right_volume;
+      unsigned int sample_rate;
+    };
+
     CMixer* m_mixer;
-    unsigned int m_input_sample_rate;
     std::array<short, MAX_SAMPLES * 2> m_buffer{};
-    std::atomic<u32> m_indexW{0};
-    std::atomic<u32> m_indexR{0};
+    Common::FifoQueue<ControlMessage, false> m_control_messages;
+
     // Volume ranges from 0-256
-    std::atomic<s32> m_LVolume{256};
-    std::atomic<s32> m_RVolume{256};
+    // SoundStream side
+    unsigned int m_ss_sample_rate;
+    s32 m_ss_left_volume{256};
+    s32 m_ss_right_volume{256};
     float m_numLeftI = 0.0f;
     u32 m_frac = 0;
+
+    // CPU side
+    s32 m_cpu_left_volume{256};
+    s32 m_cpu_right_volume{256};
+    unsigned int m_cpu_sample_rate;
+    bool m_cpu_pending_message{false};
+
+    // Ring Buffer implementation.
+    std::atomic<u32> m_indexW{0};
+    std::atomic<u32> m_indexR{0};
   };
   MixerFifo m_dma_mixer{this, 32000};
   MixerFifo m_streaming_mixer{this, 48000};

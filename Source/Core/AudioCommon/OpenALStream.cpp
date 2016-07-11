@@ -672,12 +672,6 @@ void OpenALStream::WorkerThread::DrainMixer()
     }
     m_holding_fifo.putSamples(num_frames);
   }
-
-  // Resynchronize the Mixer if it becomes desynced (due to sample rate changes).
-  // We use 4ms of lag as a fudge since different CPU side systems provide samples
-  // in different sized chunks.
-  if (m_mixer->GetFIFOLag() > m_mixer->GetSampleRate() * 4 / 1000)
-    m_mixer->Resynchronize();
 }
 
 ALsizei OpenALStream::WorkerThread::ConvertToSurround51(float* output, float* stereo_source,
