@@ -42,11 +42,6 @@ void PulseAudio::Stop()
   m_thread.join();
 }
 
-void PulseAudio::Update()
-{
-  // don't need to do anything here.
-}
-
 // Called on audio thread.
 void PulseAudio::SoundLoop()
 {

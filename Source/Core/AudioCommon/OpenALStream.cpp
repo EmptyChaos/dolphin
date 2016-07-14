@@ -273,11 +273,6 @@ void OpenALStream::SetVolume(int volume)
     m_worker->SetVolume(volume / 100.f);
 }
 
-void OpenALStream::Update()
-{
-  // Nothing.
-}
-
 void OpenALStream::Clear(bool mute)
 {
   if (m_worker)

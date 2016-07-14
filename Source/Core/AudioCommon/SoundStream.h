@@ -28,7 +28,6 @@ public:
   virtual void SetVolume(int) {}
   virtual void SoundLoop() {}
   virtual void Stop() {}
-  virtual void Update() {}
   virtual void Clear(bool mute) { m_muted = mute; }
   bool IsMuted() const { return m_muted; }
   void StartLogAudio(const std::string& filename)

@@ -117,7 +117,3 @@ void CoreAudioSound::Stop()
   if (err != noErr)
     ERROR_LOG(AUDIO, "error closing audio component");
 }
-
-void CoreAudioSound::Update()
-{
-}

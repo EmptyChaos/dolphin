@@ -25,7 +25,6 @@ public:
   bool Start() override;
   void SoundLoop() override;
   void Stop() override;
-  void Update() override;
   void Clear(bool) override;
 
   static bool isValid() { return true; }

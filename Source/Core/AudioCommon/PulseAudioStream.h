@@ -21,7 +21,6 @@ public:
 
   bool Start() override;
   void Stop() override;
-  void Update() override;
 
   static bool isValid() { return true; }
   void StateCallback(pa_context* c);

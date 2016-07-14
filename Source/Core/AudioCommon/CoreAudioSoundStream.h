@@ -18,7 +18,6 @@ public:
   void SetVolume(int volume) override;
   void SoundLoop() override;
   void Stop() override;
-  void Update() override;
 
   static bool isValid() { return true; }
 private:

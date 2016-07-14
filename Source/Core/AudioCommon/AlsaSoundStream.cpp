@@ -38,11 +38,6 @@ void AlsaSound::Stop()
   thread.join();
 }
 
-void AlsaSound::Update()
-{
-  // don't need to do anything here.
-}
-
 // Called on audio thread.
 void AlsaSound::SoundLoop()
 {
