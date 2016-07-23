@@ -3,10 +3,8 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
-#include <bitset>
+#include <array>
 #include <chrono>
-#include <condition_variable>
-#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -15,7 +13,7 @@
 #include "AudioCommon/OpenALStream.h"
 #include "AudioCommon/aldlist.h"
 #include "Common/Assert.h"
-#include "Common/BitSet.h"
+#include "Common/Event.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
 #include "Common/ScopeGuard.h"
@@ -43,7 +41,7 @@
 
 #include <soundtouch/FIFOSampleBuffer.h>
 #include <soundtouch/STTypes.h>
-#include <soundtouch/SoundTouch.h>
+#include <soundtouch/TDStretch.h>
 
 #ifdef __APPLE__
 #undef BOOL
@@ -51,17 +49,6 @@
 
 #ifdef _WIN32
 #pragma comment(lib, "openal32.lib")
-#endif
-
-// OS X lacks support for Surround and Float32.
-#ifndef AL_FORMAT_51CHN16
-#define AL_FORMAT_51CHN16 0
-#endif
-#ifndef AL_FORMAT_51CHN32
-#define AL_FORMAT_51CHN32 0
-#endif
-#ifndef AL_FORMAT_STEREO_FLOAT32
-#define AL_FORMAT_STEREO_FLOAT32 0
 #endif
 
 static constexpr int STEREO_CHANNELS = 2;
@@ -116,9 +103,8 @@ class OpenALStream::WorkerThread final
 public:
   WorkerThread()
   {
-    m_sound_touch.setChannels(2);
-    m_sound_touch.setSetting(SETTING_USE_AA_FILTER, 0);  // We aren't resampling.
-    m_sound_touch.setSetting(SETTING_USE_QUICKSEEK, 0);  // This is broken. It segfaults.
+    m_td_stretch->setChannels(STEREO_CHANNELS);
+    m_td_stretch->enableQuickSeek(false);  // This is broken. It segfaults.
   }
   ~WorkerThread();
 
@@ -143,8 +129,11 @@ private:
   void RunLoop();
 
   // [THREAD] Checks if SConfig::iLatency changed and reconfigures state appropriately
-  // May resize m_processing_buffer and change m_openal_buffer_size
+  // May change m_openal_buffer_size
   void PollForConfigurationChanges(bool force = false);
+
+  // [THREAD] Checks if we've been sent a control message and updates the state.
+  void PollForControlMessages();
 
   // [THREAD] Move samples out of CMixer into m_holding_fifo (converts to float)
   void DrainMixer();
@@ -160,7 +149,6 @@ private:
   ALsizei ConvertToOutputFormat(float* source, ALsizei size);
 
   // [THREAD] Configures SoundTouch to have the given processing latency.
-  // Called during initial setup and whenever the SConfig::iLatency value changes.
   void ConfigureSoundTouch(std::chrono::milliseconds latency_ms);
 
   // [THREAD] Computes the latency in samples from the current SoundTouch settings.
@@ -174,20 +162,17 @@ private:
   SoundTouchProcess SetSoundTouchTempo(u32 input_frames, u32 output_frames);
 
   // [THREAD] Reconfigures SoundTouch then moves m_holding_fifo into it.
-  // Returns false if the required tempo to convert the holding buffer is out of
-  // range for SoundTouch to process. SoundTouch will be emptied.
-  // If it returns true then m_sound_touch.numSamples() will contain approximately
+  // Returns false if it fails to produce an entire buffer of output.
+  // If it returns true then m_td_stretch->numSamples() will contain approximately
   // m_openal_buffer_size samples of output.
   // NOTE: m_holding_fifo may not be empty
   bool GenerateOutputBuffer();
 
   // [THREAD] Writes the given buffer into the given OpenAL buffer and queues it to
   // the source.
-  // [LOCKED] Requires m_openal_lock
   void WriteOpenALBuffer(ALuint buffer, void* source, ALsizei bytes);
 
   // [THREAD] Checks OpenAL for completed buffers and updates the tracking variables.
-  // [LOCKED] Requires m_openal_lock
   // Returns true if there are empty buffers that need refilling.
   // Returns false if all buffers are still active and being played.
   bool PollOpenALBufferStates();
@@ -197,7 +182,6 @@ private:
   ALuint GetNextEmptyOpenALBuffer();
 
   // [THREAD] Checks if OpenAL playback underrun and needs to be resumed.
-  // [LOCKED] Requires m_openal_lock
   // NOTE: When an underrun happens, it will not actually resume playback
   //   until NUM_BUFFERS OpenAL buffers have been queued (See WriteOpenALBuffer)
   void CheckForUnderrun();
@@ -219,35 +203,40 @@ private:
   // fill the buffer completely to full, it typically only manages around 90%.
   static constexpr int MIN_OPENAL_BUFFER_FRAMES = 240 * 2;
 
-  // OpenAL lock protects OpenAL state (all usage of al* functions).
-  // OpenAL is threadsafe but that just means that calling APIs from multiple
-  // threads won't break things, not that the result will make sense at all.
-  // The main problem is corrupting alGetError() since that is global, not TLS.
-  std::mutex m_openal_lock;
-  std::condition_variable m_unpaused_cvar;  // m_is_paused changes to false.
+  // OpenAL is "threadsafe" but not actually designed properly for use on
+  // multiple threads because alGetError() is global state associated with
+  // the current context. If we call OpenAL functions on multiple threads
+  // then the resulting error codes are useless junk (Windows uses TLS for
+  // GetLastError(), and most C libraries do the same for errno). We must
+  // therefore only use OpenAL on one thread so the state remains sane and
+  // use a message passing system to ask the thread to do things.
+  std::atomic<float> m_msg_volume{1.f};
+  std::atomic<bool> m_msg_pause{false};
+  std::atomic<unsigned int> m_msg_version{0};  // Lock-free message passing
+  unsigned int m_msg_version_last_check = 0;   // [THREAD] Used to detect new messages
+  Common::Event m_unpaused_event;
 
   std::thread m_thread;
   std::atomic<bool> m_thread_run{false};
-  bool m_is_paused = false;  // Requires m_openal_lock
+  bool m_is_paused = false;  // [THREAD]
 
   ALCdevicePtr m_device{nullptr, alcCloseDevice};
   ALCcontextPtr m_context{nullptr, alcDestroyContext};
   CMixer* m_mixer = nullptr;
 
   ALuint m_source = 0;
-  ALuint m_buffers[NUM_BUFFERS] = {0};
-  std::bitset<NUM_BUFFERS> m_buffers_active;
+  std::array<ALuint, NUM_BUFFERS> m_idle_buffers{};
+  unsigned int m_idle_buffers_end = 0;
   ALenum m_openal_format = 0;
 
   std::chrono::milliseconds m_last_latency{0};
   std::chrono::milliseconds m_last_canon_latency{0};
-  std::chrono::milliseconds m_min_openal_buffer_ms{0};
-  unsigned int m_openal_buffer_size = 0;  // Audio Frames
+  std::chrono::milliseconds m_min_openal_buffer_ms{0};  // Total across NUM_BUFFERS
+  unsigned int m_openal_buffer_size = 0;                // Audio Frames
 
-  soundtouch::SoundTouch m_sound_touch;
+  std::unique_ptr<soundtouch::TDStretch> m_td_stretch{soundtouch::TDStretch::newInstance()};
 
   soundtouch::FIFOSampleBuffer m_holding_fifo{STEREO_CHANNELS};
-  std::vector<float> m_processing_buffer;
   std::vector<float> m_dpl2_buffer;
   std::vector<char> m_format_conversion_buffer;
 };
@@ -310,7 +299,7 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
   }
 
   const char* default_device_name = device_list.GetDeviceName(device_list.GetDefaultDevice());
-  WARN_LOG(AUDIO, "Found OpenAL device \"%s\"", default_device_name);
+  NOTICE_LOG(AUDIO, "Found OpenAL device \"%s\"", default_device_name);
 
   ALCdevicePtr device{alcOpenDevice(default_device_name), &alcCloseDevice};
   if (!device)
@@ -347,7 +336,7 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
   }
   Common::ScopeGuard context_reset([] { alcMakeContextCurrent(nullptr); });
 
-  alGenBuffers(NUM_BUFFERS, m_buffers);
+  alGenBuffers(NUM_BUFFERS, m_idle_buffers.data());
   ALenum err = alGetError();
   if (err != AL_NO_ERROR)
   {
@@ -355,8 +344,8 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
     return false;
   }
   Common::ScopeGuard buffer_release([&] {
-    alDeleteBuffers(NUM_BUFFERS, m_buffers);
-    std::fill_n(m_buffers, NUM_BUFFERS, 0);
+    alDeleteBuffers(NUM_BUFFERS, m_idle_buffers.data());
+    std::fill_n(m_idle_buffers.data(), NUM_BUFFERS, 0);
   });
 
   alGenSources(1, &m_source);
@@ -375,44 +364,49 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
   // NOTE: Keep these sorted from most preferred to least preferred.
   bool supports_float32 = false;
   m_openal_format = 0;
-#if AL_FORMAT_STEREO_FLOAT32
+#ifdef AL_EXT_float32
   {
     std::string renderer{alGetString(AL_RENDERER)};
 
-    // Checks if an X-Fi is being used. If it is, disable FLOAT32 support as this
-    // sound card has no support for it even though it reports it does.
-    supports_float32 = renderer.find("X-Fi") == std::string::npos;
-    WARN_LOG(AUDIO, "OpenAL Renderer: %s (Float32: %s)", renderer.c_str(),
-             supports_float32 ? "yes" : "no");
+    if (alIsExtensionPresent("AL_EXT_float32"))
+    {
+      // Checks if an X-Fi is being used. If it is, disable FLOAT32 support as this
+      // sound card has no support for it even though it reports it does.
+      supports_float32 = renderer.find("X-Fi") == std::string::npos;
+    }
+    NOTICE_LOG(AUDIO, "OpenAL Renderer: %s (Float32: %s)", renderer.c_str(),
+               supports_float32 ? "yes" : "no");
   }
 #endif
-#if AL_FORMAT_51CHN32
-  if (!m_openal_format && supports_float32 && num_channels >= SURROUND51_CHANNELS)
+#ifdef AL_EXT_MCFORMATS
+  if (alIsExtensionPresent("AL_EXT_MCFORMATS"))
   {
-    float silence[32 * SURROUND51_CHANNELS] = {0.f};
-    alBufferData(m_buffers[0], AL_FORMAT_51CHN32, silence, sizeof(silence), sample_rate);
-    if (alGetError() != AL_INVALID_ENUM)
-      m_openal_format = AL_FORMAT_51CHN32;
-    else
-      WARN_LOG(AUDIO, "OpenAL: Unable to render 5.1 Surround in Float32");
+    if (!m_openal_format && supports_float32 && num_channels >= SURROUND51_CHANNELS)
+    {
+      float silence[32 * SURROUND51_CHANNELS] = {0.f};
+      alBufferData(m_idle_buffers[0], AL_FORMAT_51CHN32, silence, sizeof(silence), sample_rate);
+      if (alGetError() != AL_INVALID_ENUM)
+        m_openal_format = AL_FORMAT_51CHN32;
+      else
+        WARN_LOG(AUDIO, "OpenAL: Unable to render 5.1 Surround in Float32");
+    }
+    if (!m_openal_format && num_channels >= SURROUND51_CHANNELS)
+    {
+      short silence[32 * SURROUND51_CHANNELS] = {0};
+      alBufferData(m_idle_buffers[0], AL_FORMAT_51CHN16, silence, sizeof(silence), sample_rate);
+      if (alGetError() != AL_INVALID_ENUM)
+        m_openal_format = AL_FORMAT_51CHN16;
+      else
+        WARN_LOG(AUDIO, "OpenAL: Unable to render 5.1 Surround");
+    }
   }
 #endif
-#if AL_FORMAT_51CHN16
-  if (!m_openal_format && num_channels >= SURROUND51_CHANNELS)
-  {
-    short silence[32 * SURROUND51_CHANNELS] = {0};
-    alBufferData(m_buffers[0], AL_FORMAT_51CHN16, silence, sizeof(silence), sample_rate);
-    if (alGetError() != AL_INVALID_ENUM)
-      m_openal_format = AL_FORMAT_51CHN16;
-    else
-      WARN_LOG(AUDIO, "OpenAL: Unable to render 5.1 Surround");
-  }
-#endif
-#if AL_FORMAT_STEREO_FLOAT32
+#ifdef AL_EXT_float32
   if (!m_openal_format && supports_float32)
   {
     float silence[32 * STEREO_CHANNELS] = {0.f};
-    alBufferData(m_buffers[0], AL_FORMAT_STEREO_FLOAT32, silence, sizeof(silence), sample_rate);
+    alBufferData(m_idle_buffers[0], AL_FORMAT_STEREO_FLOAT32, silence, sizeof(silence),
+                 sample_rate);
     if (alGetError() != AL_INVALID_ENUM)
       m_openal_format = AL_FORMAT_STEREO_FLOAT32;
     else
@@ -426,8 +420,8 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
   {
     ALCint refresh = 1;
     alcGetIntegerv(device.get(), ALC_REFRESH, 1, &refresh);
-    WARN_LOG(AUDIO, "OpenAL: Refresh %dHz. Minimum OpenAL Latency: %.2f", refresh,
-             1000.0 / refresh);
+    NOTICE_LOG(AUDIO, "OpenAL: Refresh %dHz. Minimum OpenAL Latency: %.2f", refresh,
+               1000.0 * NUM_BUFFERS / refresh);
   }
 
   // Initialize DPL2
@@ -438,7 +432,7 @@ bool OpenALStream::WorkerThread::Start(CMixer* mixer, unsigned int num_channels)
   m_mixer = mixer;
   m_min_openal_buffer_ms = std::chrono::milliseconds(
       (MIN_OPENAL_BUFFER_FRAMES * NUM_BUFFERS * 1000 + sample_rate - 1) / sample_rate);
-  m_sound_touch.setSampleRate(sample_rate);
+  m_idle_buffers_end = NUM_BUFFERS;
   m_thread_run.store(true, std::memory_order_relaxed);
   m_thread = std::thread(&WorkerThread::RunLoop, this);
 
@@ -459,16 +453,16 @@ OpenALStream::WorkerThread::~WorkerThread()
     return;
 
   m_thread_run.store(false, std::memory_order_relaxed);
-  {
-    std::lock_guard<std::mutex> openal_lock(m_openal_lock);
-    m_unpaused_cvar.notify_one();
-  }
+  m_unpaused_event.Set();
   m_thread.join();
 
   // Release OpenAL resources.
   alSourceStop(m_source);
+  if (m_idle_buffers_end != NUM_BUFFERS)
+    alSourceUnqueueBuffers(m_source, NUM_BUFFERS - m_idle_buffers_end,
+                           &m_idle_buffers[m_idle_buffers_end]);
   alSourcei(m_source, AL_BUFFER, 0);
-  alDeleteBuffers(NUM_BUFFERS, m_buffers);
+  alDeleteBuffers(NUM_BUFFERS, m_idle_buffers.data());
   alDeleteSources(1, &m_source);
 
   // Release OpenAL context.
@@ -478,34 +472,24 @@ OpenALStream::WorkerThread::~WorkerThread()
 
 void OpenALStream::WorkerThread::Pause(bool paused)
 {
-  std::lock_guard<std::mutex> guard(m_openal_lock);
-  if (m_is_paused == paused)
-    return;
-
-  m_is_paused = paused;
-  if (paused)
-  {
-    alSourceStop(m_source);
-  }
-  else
-  {
-    alSourcePlay(m_source);
-    ALenum err = alGetError();
-    if (err != AL_NO_ERROR)
-      ERROR_LOG(AUDIO, "OpenAL: Source failed to resume playing: %08X", err);
-    m_unpaused_cvar.notify_one();
-  }
+  m_msg_pause.store(paused, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  m_msg_version.fetch_add(1, std::memory_order_relaxed);
+  if (!paused)
+    m_unpaused_event.Set();
 }
 
 void OpenALStream::WorkerThread::SetVolume(float volume)
 {
-  std::lock_guard<std::mutex> guard(m_openal_lock);
-  alSourcef(m_source, AL_GAIN, MathUtil::Clamp(volume, 0.f, 1.f));
+  m_msg_volume.store(MathUtil::Clamp(volume, 0.f, 1.f), std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  m_msg_version.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OpenALStream::WorkerThread::RunLoop()
 {
   Common::SetCurrentThreadName("Audio: OpenALStream");
+  std::vector<float> silence_buffer;
   PollForConfigurationChanges(true);
 
   while (m_thread_run.load(std::memory_order_relaxed))
@@ -516,22 +500,17 @@ void OpenALStream::WorkerThread::RunLoop()
     // Check for latency configuration changes
     PollForConfigurationChanges();
 
-    // Begin OpenAL update.
-    std::unique_lock<std::mutex> openal_lock(m_openal_lock);
-
-    // We start by checking if we are paused and suspend execution.
+    // Check for messages
+    PollForControlMessages();
     if (m_is_paused)
     {
-      m_unpaused_cvar.wait(openal_lock, [&] {
-        return !m_thread_run.load(std::memory_order_relaxed) || !m_is_paused;
-      });
+      m_unpaused_event.Wait();
       continue;
     }
 
     // Check if OpenAL has finished any buffers.
     if (!PollOpenALBufferStates())
     {
-      openal_lock.unlock();
       // All buffers are still playing so we just sleep and try again later.
       // We sleep for 1/4 of a buffer length (we need to keep polling for completion)
       // or 8ms (1/2 frame@60FPS), whichever is smaller.
@@ -546,37 +525,44 @@ void OpenALStream::WorkerThread::RunLoop()
     }
 
     // We have empty buffers, so fill one.
-    openal_lock.unlock();
-
     // Run the pending audio through SoundTouch. This can take a while, if the latency is too low
     // for the Host CPU then we may underrun due to the computation latency.
+    float* float_buffer = nullptr;
     ALsizei buffer_size = 0;
+    unsigned int td_stretch_frames = 0;
     if (GenerateOutputBuffer())
     {
-      // Transfer out of SoundTouch into the processing buffer
-      buffer_size = m_sound_touch.receiveSamples(m_processing_buffer.data(), m_openal_buffer_size);
-      buffer_size *= FRAME_STEREO_F32;
+      // Point the buffer at SoundTouch's output
+      td_stretch_frames = std::min(m_td_stretch->numSamples(), m_openal_buffer_size);
+      float_buffer = m_td_stretch->getOutput()->ptrBegin();
+      buffer_size = td_stretch_frames * FRAME_STEREO_F32;
     }
     else
     {
       // SoundTouch failed to produce usable output so we'll just play silence instead.
-      std::fill(m_processing_buffer.begin(), m_processing_buffer.end(), 0.f);
+      WARN_LOG(AUDIO,
+               "OpenAL: Input underrun (CPU stall or latency too low for current framelimit)");
+      EnsureCapacity(&silence_buffer, m_openal_buffer_size * STEREO_CHANNELS);
+      float_buffer = silence_buffer.data();
       buffer_size = m_openal_buffer_size * FRAME_STEREO_F32;
     }
-    _assert_(buffer_size / FRAME_STEREO_F32 >= MIN_OPENAL_BUFFER_FRAMES);
+    _assert_(buffer_size / FRAME_STEREO_F32 >= MIN_OPENAL_BUFFER_FRAMES / 2);
 
     // Do we need a format conversion?
-    void* buffer = m_processing_buffer.data();
+    void* buffer = float_buffer;
+#ifdef AL_EXT_float32
     if (m_openal_format != AL_FORMAT_STEREO_FLOAT32)
+#endif
     {
-      buffer_size = ConvertToOutputFormat(m_processing_buffer.data(), buffer_size);
+      buffer_size = ConvertToOutputFormat(float_buffer, buffer_size);
       buffer = m_format_conversion_buffer.data();
     }
 
     // Transfer the buffer to OpenAL
-    openal_lock.lock();
     WriteOpenALBuffer(GetNextEmptyOpenALBuffer(), buffer, buffer_size);
     CheckForUnderrun();
+    if (td_stretch_frames)
+      m_td_stretch->receiveSamples(td_stretch_frames);
   }
 }
 
@@ -632,8 +618,36 @@ void OpenALStream::WorkerThread::PollForConfigurationChanges(bool force)
   unsigned int latency_frames =
       static_cast<unsigned int>(latency_ms.count() * m_mixer->GetSampleRate() / std::milli::den);
   m_openal_buffer_size = (latency_frames - ComputeSoundTouchLatency()) / NUM_BUFFERS;
-  m_processing_buffer.clear();  // So we don't memcpy
-  m_processing_buffer.resize(m_openal_buffer_size * STEREO_CHANNELS);
+}
+
+void OpenALStream::WorkerThread::PollForControlMessages()
+{
+  unsigned int version = m_msg_version.load(std::memory_order_relaxed);
+  if (version == m_msg_version_last_check)
+    return;
+  m_msg_version_last_check = version;
+  std::atomic_thread_fence(std::memory_order_acquire);
+
+  // Apply volume
+  alSourcef(m_source, AL_GAIN, m_msg_volume.load(std::memory_order_relaxed));
+
+  // Apply Play/Pause
+  bool make_paused = m_msg_pause.load(std::memory_order_relaxed);
+  if (make_paused != m_is_paused)
+  {
+    m_is_paused = make_paused;
+    if (make_paused)
+    {
+      alSourceStop(m_source);
+    }
+    else
+    {
+      alSourcePlay(m_source);
+      ALenum err = alGetError();
+      if (err != AL_NO_ERROR)
+        ERROR_LOG(AUDIO, "OpenAL: Failed to resume playback of source: %08X", err);
+    }
+  }
 }
 
 void OpenALStream::WorkerThread::DrainMixer()
@@ -688,22 +702,28 @@ ALsizei OpenALStream::WorkerThread::ConvertToOutputFormat(float* source, ALsizei
 {
   switch (m_openal_format)
   {
+#ifdef AL_EXT_MCFORMATS
   case AL_FORMAT_51CHN32:  // Decode with Dolby DPL2, 2CH_F32 -> 51CH_F32
     EnsureCapacityBytes(&m_format_conversion_buffer, size * 3);
     return ConvertToSurround51(reinterpret_cast<float*>(m_format_conversion_buffer.data()), source,
                                size);
+#endif
 
+#ifdef AL_EXT_float32
   case AL_FORMAT_STEREO_FLOAT32:  // memcpy
     EnsureCapacityBytes(&m_format_conversion_buffer, size);
     std::copy_n(source, size / sizeof(float),
                 reinterpret_cast<float*>(m_format_conversion_buffer.data()));
     return size;
+#endif
 
+#ifdef AL_EXT_MCFORMATS
   case AL_FORMAT_51CHN16:  // Convert 2CH_F32 -> 51CH_F32, then convert F32 -> S16
     EnsureCapacityBytes(&m_dpl2_buffer, size * 3);
     size = ConvertToSurround51(m_dpl2_buffer.data(), source, size);
     source = m_dpl2_buffer.data();
-  // fallthrough
+// fallthrough
+#endif
 
   case AL_FORMAT_STEREO16:  // Convert F32 -> S16
   {
@@ -748,7 +768,6 @@ void OpenALStream::WorkerThread::ConfigureSoundTouch(std::chrono::milliseconds l
   if (latency < milliseconds(42))
   {
     _assert_(latency > milliseconds(18));
-    m_sound_touch.setSetting(SETTING_SEQUENCE_MS, ST_MIN_SEQUENCE);
     if (latency < milliseconds(32))  // Minimum 19
     {
       // max(1 * (max(1, 2 * 2) - 2) + 2, max(1, 2 * 2)) + 15 = 19ms
@@ -758,16 +777,16 @@ void OpenALStream::WorkerThread::ConfigureSoundTouch(std::chrono::milliseconds l
       // NOTE: This only accepts odd latency values. Even ones alias down.
       //   20 -> 19, 22 -> 21, 24 -> 23, etc.
       milliseconds overlap = (latency - milliseconds(15)) / 2;
-      m_sound_touch.setSetting(SETTING_SEEKWINDOW_MS, ST_MIN_SEEKWINDOW);
-      m_sound_touch.setSetting(SETTING_OVERLAP_MS, static_cast<int>(overlap.count()));
+      m_td_stretch->setParameters(m_mixer->GetSampleRate(), ST_MIN_SEQUENCE, ST_MIN_SEEKWINDOW,
+                                  static_cast<int>(overlap.count()));
     }
     else
     {
       // max(1 * (max(1, 8 * 2) - 8) + 8, max(1, 8 * 2)) + 16 = 32ms
       // max(1 * (max(1, 8 * 2) - 8) + 8, max(1, 8 * 2)) + 25 = 41ms
       milliseconds seek_window = latency - milliseconds(16);
-      m_sound_touch.setSetting(SETTING_OVERLAP_MS, ST_MAX_OVERLAP);
-      m_sound_touch.setSetting(SETTING_SEEKWINDOW_MS, static_cast<int>(seek_window.count()));
+      m_td_stretch->setParameters(m_mixer->GetSampleRate(), ST_MIN_SEQUENCE,
+                                  static_cast<int>(seek_window.count()), ST_MAX_OVERLAP);
     }
   }
   else
@@ -782,9 +801,9 @@ void OpenALStream::WorkerThread::ConfigureSoundTouch(std::chrono::milliseconds l
     // max(1 * (23 - 8) + 8, 23) + 25 = 48ms (latency = 500ms) [ChunkSize10 = 150ms; OpenAL = 250ms]
     milliseconds sequence =
         (latency - milliseconds(42 - 17)) / static_cast<u32>(ST_MAX_TEMPO * NUM_BUFFERS);
-    m_sound_touch.setSetting(SETTING_SEEKWINDOW_MS, ST_MAX_SEEKWINDOW);
-    m_sound_touch.setSetting(SETTING_OVERLAP_MS, ST_MAX_OVERLAP);
-    m_sound_touch.setSetting(SETTING_SEQUENCE_MS, std::max(static_cast<int>(sequence.count()), 1));
+    m_td_stretch->setParameters(m_mixer->GetSampleRate(),
+                                std::max(static_cast<int>(sequence.count()), ST_MIN_SEQUENCE),
+                                ST_MAX_SEEKWINDOW, ST_MAX_OVERLAP);
   }
 }
 
@@ -792,13 +811,14 @@ unsigned int OpenALStream::WorkerThread::ComputeSoundTouchLatency(double tempo) 
 {
   _assert_(tempo > 0.0);
 
-  // u64 to implicitly perform all calculations using wider arithmetic.
-  u64 sample_rate = m_mixer->GetSampleRate();
-  u32 overlap = static_cast<u32>(m_sound_touch.getSetting(SETTING_OVERLAP_MS) * sample_rate / 1000);
-  u32 sequence =
-      static_cast<u32>(m_sound_touch.getSetting(SETTING_SEQUENCE_MS) * sample_rate / 1000);
-  u32 seek_window =
-      static_cast<u32>(m_sound_touch.getSetting(SETTING_SEEKWINDOW_MS) * sample_rate / 1000);
+  int sample_rate = 0;
+  int overlap = 0;
+  int sequence = 0;
+  int seek_window = 0;
+  m_td_stretch->getParameters(&sample_rate, &sequence, &seek_window, &overlap);
+  overlap = static_cast<int>(static_cast<u64>(overlap) * sample_rate / 1000);
+  sequence = static_cast<int>(static_cast<u64>(sequence) * sample_rate / 1000);
+  seek_window = static_cast<int>(static_cast<u64>(seek_window) * sample_rate / 1000);
 
   // See ConfigureSoundTouch for the explanation of this formula.
   u32 internal_seek_window = std::max(sequence, overlap * 2);
@@ -810,10 +830,10 @@ auto OpenALStream::WorkerThread::SetSoundTouchTempo(u32 input_frames, u32 output
     -> SoundTouchProcess
 {
   // Include the current latency samples that are queued in SoundTouch's input.
-  u32 total_input = m_sound_touch.numUnprocessedSamples() + input_frames;
+  u32 total_input = m_td_stretch->getInput()->numSamples() + input_frames;
   // We also include any left-over output from the previous buffer if it
   // generated slightly too much.
-  u32 adjusted_output = m_sound_touch.numSamples();
+  u32 adjusted_output = m_td_stretch->numSamples();
   if (adjusted_output >= output_frames)
   {
     // Caused by ChunkSize being too big and producing too many samples
@@ -840,23 +860,29 @@ auto OpenALStream::WorkerThread::SetSoundTouchTempo(u32 input_frames, u32 output
   // [a] Tempo * (out + SeekWindow - OVERLAP) = in - OVERLAP - SEEKWINDOW
   // [a] Tempo = (in - OVERLAP - SEEKWINDOW) / (out + SeekWindow - OVERLAP)
   // [b] Tempo = (in - SeekWindow - SEEKWINDOW) / out
-  u64 sample_rate = m_mixer->GetSampleRate();
-  s64 overlap = m_sound_touch.getSetting(SETTING_OVERLAP_MS) * sample_rate / 1000;
-  s64 sequence = m_sound_touch.getSetting(SETTING_SEQUENCE_MS) * sample_rate / 1000;
-  s64 seek_window = m_sound_touch.getSetting(SETTING_SEEKWINDOW_MS) * sample_rate / 1000;
-  s64 internal_seek_window = std::max(sequence, overlap * 2);
+  int sample_rate = 0;
+  int sequence = 0;
+  int seek_window = 0;
+  int overlap = 0;
+  m_td_stretch->getParameters(&sample_rate, &sequence, &seek_window, &overlap);
+  sequence = static_cast<int>(static_cast<u64>(sequence) * sample_rate / 1000);
+  seek_window = static_cast<int>(static_cast<u64>(seek_window) * sample_rate / 1000);
+  overlap = static_cast<int>(static_cast<u64>(overlap) * sample_rate / 1000);
+  int internal_seek_window = std::max(sequence, overlap * 2);
 
-  double tempo_a = static_cast<double>(total_input - overlap - seek_window + 1) /
-                   static_cast<double>(adjusted_output + internal_seek_window - overlap);
+  double tempo_a =
+      static_cast<double>(static_cast<s64>(total_input) - overlap - seek_window + 1) /
+      static_cast<double>(static_cast<s64>(adjusted_output) + internal_seek_window - overlap);
   double tempo_b =
-      static_cast<double>(total_input - internal_seek_window - seek_window + 1) / adjusted_output;
+      static_cast<double>(static_cast<s64>(total_input) - internal_seek_window - seek_window + 1) /
+      adjusted_output;
 
   // We now need to select which of the two tempo functions to use.
   // Below 1.0, tempo_b is the correct one. Above 1.0, tempo_a is used.
   // The functions intersect at 1.0 where tempo_b continues upward at a
   // sharper slope than tempo_a.
   double tempo = std::min(tempo_a, tempo_b);
-  NOTICE_LOG(AUDIO, "OpenAL: Tempo is %.2f (a = %.2f, b = %.2f)", tempo, tempo_a, tempo_b);
+  DEBUG_LOG(AUDIO, "OpenAL: Tempo is %.2f (a = %.2f, b = %.2f)", tempo, tempo_a, tempo_b);
 
   // We can get negative tempos if the input is abysmally tiny, or zero.
   // i.e. the emulator has stalled for too long and we've run out of audio.
@@ -867,10 +893,10 @@ auto OpenALStream::WorkerThread::SetSoundTouchTempo(u32 input_frames, u32 output
   // anything with it.
   if (tempo < ST_MIN_TEMPO || tempo > ST_MAX_TEMPO)
   {
-    m_sound_touch.setTempo(MathUtil::Clamp(tempo, ST_MIN_TEMPO, ST_MAX_TEMPO));
+    m_td_stretch->setTempo(MathUtil::Clamp(tempo, ST_MIN_TEMPO, ST_MAX_TEMPO));
     return SoundTouchProcess::Failed;
   }
-  m_sound_touch.setTempo(tempo);
+  m_td_stretch->setTempo(tempo);
   return SoundTouchProcess::Normal;
 }
 
@@ -881,7 +907,7 @@ bool OpenALStream::WorkerThread::GenerateOutputBuffer()
   // since the holding FIFO will contain audio roughly equal to the amount of
   // depletion from the playing buffer (i.e. current buffer is 50% played,
   // the holding FIFO will have 1.5 audio buffers in it).
-  u32 num_active_buffers = static_cast<u32>(m_buffers_active.count());
+  u32 num_active_buffers = static_cast<u32>(NUM_BUFFERS - m_idle_buffers_end);
   u32 reserve = 0;
   if (num_active_buffers)
   {
@@ -894,12 +920,10 @@ bool OpenALStream::WorkerThread::GenerateOutputBuffer()
     alGetSourcei(m_source, AL_SAMPLE_OFFSET, &offset);
     reserve = std::min<u32>(offset, m_openal_buffer_size);
   }
-  u32 num_inactive_buffers = NUM_BUFFERS - num_active_buffers;
-  _assert_(num_inactive_buffers);
   // NOTE: This is fixed point using base m_openal_buffer_size as the fixed base.
   u32 holding_fifo_slice =
       static_cast<u32>(static_cast<u64>(m_holding_fifo.numSamples()) * m_openal_buffer_size /
-                       (static_cast<u64>(num_inactive_buffers) * m_openal_buffer_size + reserve));
+                       (static_cast<u64>(m_idle_buffers_end) * m_openal_buffer_size + reserve));
 
   // Feed the holding FIFO through SoundTouch now.
   // We always do this unless explicitly instructed not to in order to keep
@@ -909,27 +933,26 @@ bool OpenALStream::WorkerThread::GenerateOutputBuffer()
   auto success = SetSoundTouchTempo(holding_fifo_slice, m_openal_buffer_size);
   if (success != SoundTouchProcess::None)
   {
-    m_sound_touch.putSamples(m_holding_fifo.ptrBegin(), holding_fifo_slice);
+    m_td_stretch->putSamples(m_holding_fifo.ptrBegin(), holding_fifo_slice);
     m_holding_fifo.receiveSamples(holding_fifo_slice);
   }
   if (success == SoundTouchProcess::Failed)
   {
     // If SoundTouch cannot process the current audio then what we got after
     // processing is junk so throw it away.
-    m_sound_touch.adjustAmountOfSamples(0);
+    m_td_stretch->adjustAmountOfSamples(0);
     return false;
   }
-  NOTICE_LOG(AUDIO, "Samples In: %u, Out: %u", holding_fifo_slice, m_sound_touch.numSamples());
+  DEBUG_LOG(AUDIO, "Samples In: %u, Out: %u", holding_fifo_slice, m_td_stretch->numSamples());
   // If SoundTouch is not primed and we don't have enough audio to prime it
   // then we can "succeed" but produce no output. This usually happens when
   // recovering from a frame stall (i.e. shader stutter that took longer than
   // our buffer latency to clear so we ran out of audio to use)
-  return m_sound_touch.numSamples() >= MIN_OPENAL_BUFFER_FRAMES;
+  return m_td_stretch->numSamples() >= MIN_OPENAL_BUFFER_FRAMES;
 }
 
 void OpenALStream::WorkerThread::WriteOpenALBuffer(ALuint buffer, void* source, ALsizei bytes)
 {
-  // NOTE: m_openal_lock is held
   _assert_(buffer != 0);
 
   // Submit data to OpenAL (it makes an internal copy)
@@ -949,59 +972,32 @@ void OpenALStream::WorkerThread::WriteOpenALBuffer(ALuint buffer, void* source, 
     ERROR_LOG(AUDIO, "OpenAL: Failed to attach buffer to source: %08X", err);
     return;
   }
-
-  // Mark buffer active
-  for (unsigned int i = 0; i < NUM_BUFFERS; ++i)
-  {
-    if (m_buffers[i] == buffer)
-    {
-      m_buffers_active[i] = true;
-      break;
-    }
-  }
 }
 
 bool OpenALStream::WorkerThread::PollOpenALBufferStates()
 {
-  // NOTE: m_openal_lock is held
-
   ALint num_buffers_done = 0;
   alGetSourcei(m_source, AL_BUFFERS_PROCESSED, &num_buffers_done);
-  if (!num_buffers_done)
-    return !m_buffers_active.all();
-
-  ALuint unqueued_buffers[NUM_BUFFERS] = {0};
-  alSourceUnqueueBuffers(m_source, num_buffers_done, unqueued_buffers);
-  if (!unqueued_buffers[0])
-    return !m_buffers_active.all();
-
-  // Clear active flags for all buffers we got back
-  for (ALint i = 0; i < num_buffers_done; ++i)
+  if (num_buffers_done)
   {
-    for (unsigned int j = 0; j < NUM_BUFFERS; ++j)
-    {
-      if (m_buffers[j] == unqueued_buffers[i])
-      {
-        m_buffers_active[j] = false;
-        break;
-      }
-    }
+    alSourceUnqueueBuffers(m_source, num_buffers_done, &m_idle_buffers[m_idle_buffers_end]);
+    if (m_idle_buffers[m_idle_buffers_end])
+      m_idle_buffers_end += num_buffers_done;
   }
-  return true;
+  return m_idle_buffers_end != 0;
 }
 
 ALuint OpenALStream::WorkerThread::GetNextEmptyOpenALBuffer()
 {
-  static_assert(NUM_BUFFERS <= sizeof(u32) * 8, "Too many bits to use LeastSignificantSetBit");
-  int idx = LeastSignificantSetBit(static_cast<u32>(~m_buffers_active.to_ulong()));
-  if (idx < 0 || static_cast<unsigned int>(idx) >= NUM_BUFFERS)
+  if (!m_idle_buffers_end)
     return 0;
-  return m_buffers[idx];
+  ALuint buffer = m_idle_buffers[--m_idle_buffers_end];
+  m_idle_buffers[m_idle_buffers_end] = 0;
+  return buffer;
 }
 
 void OpenALStream::WorkerThread::CheckForUnderrun()
 {
-  // NOTE: m_openal_lock is held
   if (m_is_paused)
     return;
 
@@ -1010,7 +1006,7 @@ void OpenALStream::WorkerThread::CheckForUnderrun()
   // Wait until ALL buffers are full (i.e. maximum latency attained)
   // before beginning to play otherwise we'll probably just underrun
   // again immediately because each individual buffer is small.
-  if (state != AL_PLAYING && m_buffers_active.all())
+  if (state != AL_PLAYING && !m_idle_buffers_end)
   {
     // Buffer underrun occurred, resume playback
     alSourcePlay(m_source);

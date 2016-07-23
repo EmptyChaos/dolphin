@@ -36,7 +36,7 @@ SConfig::SConfig()
       bAccurateNaNs(false), iTimingVariance(40), bCPUThread(true), bDSPThread(false), bDSPHLE(true),
       bSkipIdle(true), bSyncGPUOnSkipIdleHack(true), bNTSC(false), bForceNTSCJ(false),
       bHLE_BS2(true), bEnableCheats(false), bEnableMemcardSdWriting(true), bDPL2Decoder(false),
-      iLatency(14), bRunCompareServer(false), bRunCompareClient(false), bMMU(false),
+      iLatency(60), bRunCompareServer(false), bRunCompareClient(false), bMMU(false),
       bDCBZOFF(false), iBBDumpPort(0), bFastDiscSpeed(false), bSyncGPU(false), SelectedLanguage(0),
       bOverrideGCLanguage(false), bWii(false), bConfirmStop(false), bHideCursor(false),
       bAutoHideCursor(false), bUsePanicHandlers(true), bOnScreenDisplayMessages(true),
@@ -518,7 +518,7 @@ void SConfig::LoadCoreSettings(IniFile& ini)
   core->Get("SelectedLanguage", &SelectedLanguage, 0);
   core->Get("OverrideGCLang", &bOverrideGCLanguage, false);
   core->Get("DPL2Decoder", &bDPL2Decoder, false);
-  core->Get("Latency", &iLatency, 2);
+  core->Get("Latency", &iLatency, 60);
   core->Get("MemcardAPath", &m_strMemoryCardA);
   core->Get("MemcardBPath", &m_strMemoryCardB);
   core->Get("AgpCartAPath", &m_strGbaCartA);
@@ -657,7 +657,7 @@ void SConfig::LoadDefaults()
   bOverrideGCLanguage = false;
   bWii = false;
   bDPL2Decoder = false;
-  iLatency = 14;
+  iLatency = 60;
 
   iPosX = 100;
   iPosY = 100;
