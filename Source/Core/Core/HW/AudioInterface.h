@@ -25,6 +25,7 @@ void RegisterMMIO(MMIO::Mapping* mmio, u32 base);
 
 // Get the audio rates (48000 or 32000 only)
 unsigned int GetAIDSampleRate();
+unsigned int GetAISSampleRate();
 
 void GenerateAISInterrupt();
 

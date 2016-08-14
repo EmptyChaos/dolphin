@@ -344,21 +344,24 @@ static u32 ProcessDTKSamples(short* tempPCM, u32 num_samples)
 static void DTKStreamingCallback(u64 userdata, s64 cyclesLate)
 {
   // Send audio to the mixer.
-  static const int NUM_SAMPLES = 48000 / 2000 * 7;  // 3.5ms of 48kHz samples
+  static constexpr unsigned int NUM_SAMPLES = 48000 * 35 / 10000;  // 3.5ms of 48kHz samples
   short tempPCM[NUM_SAMPLES * 2];
-  unsigned samples_processed;
+  // Sample Rate is 48000 or 32000.
+  const unsigned int SAMPLE_RATE = AudioInterface::GetAISSampleRate();
+  const unsigned int SAMPLES_PER_CALLBACK = SAMPLE_RATE * 35 / 10000;
+  unsigned int samples_processed;
   if (s_stream && AudioInterface::IsPlaying())
   {
-    samples_processed = ProcessDTKSamples(tempPCM, NUM_SAMPLES);
+    samples_processed = ProcessDTKSamples(tempPCM, SAMPLES_PER_CALLBACK);
   }
   else
   {
     memset(tempPCM, 0, sizeof(tempPCM));
-    samples_processed = NUM_SAMPLES;
+    samples_processed = SAMPLES_PER_CALLBACK;
   }
   g_sound_stream->GetMixer()->PushStreamingSamples(tempPCM, samples_processed);
 
-  int ticks_to_dtk = int(SystemTimers::GetTicksPerSecond() * u64(samples_processed) / 48000);
+  int ticks_to_dtk = int(SystemTimers::GetTicksPerSecond() * u64(samples_processed) / SAMPLE_RATE);
   CoreTiming::ScheduleEvent(ticks_to_dtk - cyclesLate, s_dtk);
 }
 

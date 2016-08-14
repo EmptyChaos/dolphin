@@ -293,6 +293,11 @@ unsigned int GetAIDSampleRate()
   return g_AIDSampleRate;
 }
 
+unsigned int GetAISSampleRate()
+{
+  return g_AISSampleRate;
+}
+
 static void Update(u64 userdata, s64 cyclesLate)
 {
   if (m_Control.PSTAT)
