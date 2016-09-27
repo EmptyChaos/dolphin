@@ -15,13 +15,12 @@
 #include "Core/HLE/HLE_OS.h"
 #include "Core/HW/Memmap.h"
 #include "Core/IPC_HLE/WII_IPC_HLE_Device_es.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PPCSymbolDB.h"
 #include "Core/PowerPC/PowerPC.h"
 
 namespace HLE
 {
-using namespace PowerPC;
-
 typedef void (*TPatchFunction)();
 
 static std::map<u32, u32> s_original_instructions;
@@ -81,7 +80,7 @@ void Patch(u32 addr, const char* hle_func_name)
     if (!strcmp(OSPatches[i].m_szPatchName, hle_func_name))
     {
       s_original_instructions[addr] = i;
-      PowerPC::ppcState.iCache.Invalidate(addr);
+      JitInterface::InvalidateICache(addr, 4, true);
       return;
     }
   }
@@ -115,7 +114,7 @@ void PatchFunctions()
       for (u32 addr = symbol->address; addr < symbol->address + symbol->size; addr += 4)
       {
         s_original_instructions[addr] = i;
-        PowerPC::ppcState.iCache.Invalidate(addr);
+        JitInterface::InvalidateICache(addr, 4, true);
       }
       INFO_LOG(OSHLE, "Patching %s %08x", OSPatches[i].m_szPatchName, symbol->address);
     }
@@ -177,7 +176,7 @@ int GetFunctionFlagsByIndex(u32 index)
 bool IsEnabled(int flags)
 {
   if (flags == HLE::HLE_TYPE_DEBUG && !SConfig::GetInstance().bEnableDebugging &&
-      PowerPC::GetMode() != MODE_INTERPRETER)
+      PowerPC::GetMode() != PowerPC::MODE_INTERPRETER)
     return false;
 
   return true;
@@ -200,7 +199,7 @@ u32 UnPatch(const std::string& patch_name)
       if (i->second == patch_idx)
       {
         addr = i->first;
-        PowerPC::ppcState.iCache.Invalidate(i->first);
+        JitInterface::InvalidateICache(addr, 4, true);
         i = s_original_instructions.erase(i);
       }
       else
@@ -216,8 +215,10 @@ u32 UnPatch(const std::string& patch_name)
     for (u32 addr = symbol->address; addr < symbol->address + symbol->size; addr += 4)
     {
       s_original_instructions.erase(addr);
-      PowerPC::ppcState.iCache.Invalidate(addr);
     }
+    // This probably doesn't work if the function spans a page bounary with discontiguous
+    // physical addresses.
+    JitInterface::InvalidateICache(symbol->address, symbol->size & ~3U, true);
     return symbol->address;
   }
 
@@ -234,7 +235,7 @@ bool UnPatch(u32 addr, const std::string& name)
     return false;
 
   s_original_instructions.erase(itr);
-  PowerPC::ppcState.iCache.Invalidate(addr);
+  JitInterface::InvalidateICache(addr, 4, true);
   return true;
 }
 
