@@ -83,7 +83,22 @@ static const SPatch OSBreakPoints[] = {
 
 static void InstallPatch(u32 paddr, u32 vaddr, u32 index)
 {
-  s_original_instructions[paddr] = {index, vaddr};
+  HookInfo& info = s_original_instructions[paddr];
+  if (info.hook)
+  {
+    if (index != info.hook)
+    {
+      ERROR_LOG(OSHLE, "Hook \"%s\" @%08X (%08X) is being overwritten by \"%s\" (%08X)",
+                OSPatches[info.hook].m_szPatchName, paddr, info.virtual_address,
+                OSPatches[index].m_szPatchName, vaddr);
+    }
+    else
+    {
+      WARN_LOG(OSHLE, "Hook \"%s\" @%08X being reinstalled at the same address!",
+               OSPatches[index].m_szPatchName, paddr);
+    }
+  }
+  info = {index, vaddr};
   JitInterface::InvalidateICacheByPhysicalAddress(paddr, 4, true);
 }
 
