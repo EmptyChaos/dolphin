@@ -245,6 +245,13 @@ void InvalidateICache(u32 address, u32 size, bool forced)
     jit->GetBlockCache()->InvalidateICache(address, size, forced);
 }
 
+void InvalidateICacheByPhysicalAddress(u32 paddress, u32 size, bool forced)
+{
+  if (jit)
+    jit->GetBlockCache()->InvalidateICache(paddress, size, forced,
+                                           JitBaseBlockCache::AddressMode::Physical);
+}
+
 void CompileExceptionCheck(ExceptionType type)
 {
   if (!jit)

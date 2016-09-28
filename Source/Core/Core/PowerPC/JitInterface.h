@@ -41,6 +41,7 @@ void ClearSafe();
 
 // If "forced" is true, a recompile is being requested on code that hasn't been modified.
 void InvalidateICache(u32 address, u32 size, bool forced);
+void InvalidateICacheByPhysicalAddress(u32 paddress, u32 size, bool forced);
 
 void CompileExceptionCheck(ExceptionType type);
 

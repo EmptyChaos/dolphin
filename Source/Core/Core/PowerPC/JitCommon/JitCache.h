@@ -112,6 +112,13 @@ public:
   static constexpr u32 iCache_Num_Elements = 0x10000;
   static constexpr u32 iCache_Mask = iCache_Num_Elements - 1;
 
+  // Addressing mode for invalidating blocks
+  enum class AddressMode
+  {
+    Virtual,
+    Physical
+  };
+
 private:
   // We store the metadata of all blocks in a linear way within this array.
   // Note: blocks[0] must not be used as it is referenced as invalid block in iCache.
@@ -182,7 +189,8 @@ public:
   // assembly version.)
   const u8* Dispatch();
 
-  void InvalidateICache(u32 address, const u32 length, bool forced);
+  void InvalidateICache(u32 address, const u32 length, bool forced,
+                        AddressMode addressing = AddressMode::Virtual);
 
   u32* GetBlockBitSet() const { return valid_block.m_valid_block.get(); }
 };

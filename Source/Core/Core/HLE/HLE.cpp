@@ -23,7 +23,15 @@ namespace HLE
 {
 typedef void (*TPatchFunction)();
 
-static std::map<u32, u32> s_original_instructions;
+struct HookInfo
+{
+  u32 hook;
+  u32 virtual_address;  // Address used to register it
+};
+
+// Maps PHYSICAL addresses to OSPatches indexes
+// We need to use physical addresses to break the dependency on MSR.IR
+static std::map<u32, HookInfo> s_original_instructions;
 
 enum
 {
@@ -73,17 +81,58 @@ static const SPatch OSBreakPoints[] = {
     {"FAKE_TO_SKIP_0", HLE_Misc::UnimplementedFunction},
 };
 
-void Patch(u32 addr, const char* hle_func_name)
+static void InstallPatch(u32 paddr, u32 vaddr, u32 index)
+{
+  s_original_instructions[paddr] = {index, vaddr};
+  JitInterface::InvalidateICacheByPhysicalAddress(paddr, 4, true);
+}
+
+static PowerPC::TranslateResult PatchByIndex(u32 vaddr, u32 index)
+{
+  // We need to translate the address otherwise we'll forever be dependent on the state
+  // of the MSR.IR bit and assuming that the IBAT and page tables never change.
+  auto translation = PowerPC::JitCache_TranslateAddress(vaddr);
+  if (translation.valid)
+    InstallPatch(translation.address, vaddr, index);
+  return translation;
+}
+
+static u32 GetFunctionByName(const char* name)
 {
   for (u32 i = 1; i < ArraySize(OSPatches); ++i)
   {
-    if (!strcmp(OSPatches[i].m_szPatchName, hle_func_name))
+    if (!strcmp(OSPatches[i].m_szPatchName, name))
     {
-      s_original_instructions[addr] = i;
-      JitInterface::InvalidateICache(addr, 4, true);
-      return;
+      return i;
     }
   }
+  return 0;
+}
+
+PowerPC::TranslateResult Patch(u32 vaddr, const char* hle_func_name)
+{
+  u32 index = GetFunctionByName(hle_func_name);
+  if (!index)
+  {
+    PanicAlert("HLE Function \"%s\" is not registered (Patch Address = %08X)", hle_func_name,
+               vaddr);
+    return {};
+  }
+
+  return PatchByIndex(vaddr, index);
+}
+
+void PatchPhysical(u32 paddr, const char* hle_func_name)
+{
+  u32 index = GetFunctionByName(hle_func_name);
+  if (!index)
+  {
+    PanicAlert("HLE Function \"%s\" is not registered (Physical Patch = %08X)", hle_func_name,
+               paddr);
+    return;
+  }
+
+  InstallPatch(paddr, paddr, index);
 }
 
 void PatchFunctions()
@@ -91,9 +140,9 @@ void PatchFunctions()
   // Remove all hooks that aren't fixed address hooks
   for (auto i = s_original_instructions.begin(); i != s_original_instructions.end();)
   {
-    if (OSPatches[i->second].flags != HLE_TYPE_FIXED)
+    if (OSPatches[i->second.hook].flags != HLE_TYPE_FIXED)
     {
-      PowerPC::ppcState.iCache.Invalidate(i->first);
+      JitInterface::InvalidateICacheByPhysicalAddress(i->first, 4, true);
       i = s_original_instructions.erase(i);
     }
     else
@@ -113,8 +162,7 @@ void PatchFunctions()
     {
       for (u32 addr = symbol->address; addr < symbol->address + symbol->size; addr += 4)
       {
-        s_original_instructions[addr] = i;
-        JitInterface::InvalidateICache(addr, 4, true);
+        PatchByIndex(addr, i);
       }
       INFO_LOG(OSHLE, "Patching %s %08x", OSPatches[i].m_szPatchName, symbol->address);
     }
@@ -157,10 +205,19 @@ void Execute(u32 _CurrentPC, u32 _Instruction)
   // OSPatches[pos].m_szPatchName);
 }
 
-u32 GetFunctionIndex(u32 addr)
+static std::map<u32, HookInfo>::iterator GetIteratorForVirtualAddress(u32 vaddr)
 {
-  auto iter = s_original_instructions.find(addr);
-  return (iter != s_original_instructions.end()) ? iter->second : 0;
+  auto translation = PowerPC::JitCache_TranslateAddress(vaddr);
+  if (!translation.valid)
+    return s_original_instructions.end();
+
+  return s_original_instructions.find(translation.address);
+}
+
+u32 GetFunctionIndex(u32 vaddr)
+{
+  auto iter = GetIteratorForVirtualAddress(vaddr);
+  return (iter != s_original_instructions.end()) ? iter->second.hook : 0;
 }
 
 int GetFunctionTypeByIndex(u32 index)
@@ -196,10 +253,10 @@ u32 UnPatch(const std::string& patch_name)
     // Reverse search by OSPatch key instead of address
     for (auto i = s_original_instructions.begin(); i != s_original_instructions.end();)
     {
-      if (i->second == patch_idx)
+      if (i->second.hook == patch_idx)
       {
-        addr = i->first;
-        JitInterface::InvalidateICache(addr, 4, true);
+        addr = i->second.virtual_address;
+        JitInterface::InvalidateICacheByPhysicalAddress(i->first, 4, true);
         i = s_original_instructions.erase(i);
       }
       else
@@ -214,28 +271,27 @@ u32 UnPatch(const std::string& patch_name)
   {
     for (u32 addr = symbol->address; addr < symbol->address + symbol->size; addr += 4)
     {
-      s_original_instructions.erase(addr);
+      auto itr = GetIteratorForVirtualAddress(addr);
+      if (itr != s_original_instructions.end())
+        UnPatch(itr->first, patch_name);
     }
-    // This probably doesn't work if the function spans a page bounary with discontiguous
-    // physical addresses.
-    JitInterface::InvalidateICache(symbol->address, symbol->size & ~3U, true);
     return symbol->address;
   }
 
   return 0;
 }
 
-bool UnPatch(u32 addr, const std::string& name)
+bool UnPatch(u32 paddr, const std::string& name)
 {
-  auto itr = s_original_instructions.find(addr);
+  auto itr = s_original_instructions.find(paddr);
   if (itr == s_original_instructions.end())
     return false;
 
-  if (!name.empty() && name != OSPatches[itr->second].m_szPatchName)
+  if (!name.empty() && name != OSPatches[itr->second.hook].m_szPatchName)
     return false;
 
   s_original_instructions.erase(itr);
-  JitInterface::InvalidateICache(addr, 4, true);
+  JitInterface::InvalidateICacheByPhysicalAddress(paddr, 4, true);
   return true;
 }
 

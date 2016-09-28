@@ -7,6 +7,7 @@
 #include <string>
 
 #include "Common/CommonTypes.h"
+#include "Core/PowerPC/PowerPC.h"
 
 namespace HLE
 {
@@ -27,10 +28,13 @@ enum HookFlag
 void PatchFunctions();
 void Clear();
 
-void Patch(u32 pc, const char* func_name);
-u32 UnPatch(const std::string& patchName);
-bool UnPatch(u32 addr, const std::string& name = {});
-void Execute(u32 _CurrentPC, u32 _Instruction);
+// Returns the physical address of the hook (i.e. independent of the current MSR.IR setting)
+PowerPC::TranslateResult Patch(u32 pc, const char* func_name);
+void PatchPhysical(u32 pc, const char* func_name);
+u32 UnPatch(const std::string& patch_name);
+// UnPatch takes a PHYSICAL address (return value of Patch)
+bool UnPatch(u32 paddr, const std::string& name = {});
+void Execute(u32 current_PC, u32 function_idx);
 
 u32 GetFunctionIndex(u32 em_address);
 int GetFunctionTypeByIndex(u32 index);

@@ -309,12 +309,17 @@ void JitBaseBlockCache::DestroyBlock(int block_num, bool invalidate)
   WriteDestroyBlock(b);
 }
 
-void JitBaseBlockCache::InvalidateICache(u32 address, const u32 length, bool forced)
+void JitBaseBlockCache::InvalidateICache(u32 address, const u32 length, bool forced,
+                                         AddressMode addressing)
 {
-  auto translated = PowerPC::JitCache_TranslateAddress(address);
-  if (!translated.valid)
-    return;
-  u32 pAddr = translated.address;
+  u32 pAddr = address;
+  if (addressing == AddressMode::Virtual)
+  {
+    auto translated = PowerPC::JitCache_TranslateAddress(address);
+    if (!translated.valid)
+      return;
+    pAddr = translated.address;
+  }
 
   // Optimize the common case of length == 32 which is used by Interpreter::dcb*
   bool destroy_block = true;
