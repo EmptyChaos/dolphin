@@ -286,7 +286,7 @@ wxSize GetTextWidgetMinSize(const wxSpinCtrl* spinner)
 }
 
 static wxImage LoadScaledImage(const std::string& file_path, const wxWindow* context,
-                               const wxSize& output_size, const wxRect& usable_rect, LSIFlags flags,
+                               wxSize output_size, wxRect usable_rect, LSIFlags flags,
                                const wxColour& fill_color)
 {
   std::string fpath, fname, fext;
@@ -367,8 +367,16 @@ static wxImage LoadScaledImage(const std::string& file_path, const wxWindow* con
     image.Clear(0xFF);
   }
 
-  return ScaleImage(image, selected_image_scale, window_scale_factor, output_size, usable_rect,
-                    flags, fill_color);
+  // Convert output_size and usable_rect into framebuffer pixel sizes
+  if (window_scale_factor != 1.0)
+  {
+    output_size *= window_scale_factor;
+    usable_rect.SetPosition(usable_rect.GetPosition() * window_scale_factor);
+    usable_rect.SetSize(usable_rect.GetSize() * window_scale_factor);
+  }
+
+  return ScaleImage(image, selected_image_scale, scale_factor, output_size, usable_rect, flags,
+                    fill_color);
 }
 
 wxBitmap LoadScaledBitmap(const std::string& file_path, const wxWindow* context,
@@ -395,22 +403,36 @@ wxBitmap LoadScaledThemeBitmap(const std::string& name, const wxWindow* context,
   return LoadScaledBitmap(path, context, output_size, usable_rect, flags, fill_color);
 }
 
+static wxBitmap ScaleImageToBitmap(const wxImage& image, const wxWindow* context,
+                                   double source_scale, wxSize output_size, wxRect usable_rect,
+                                   LSIFlags flags, const wxColour& fill_color)
+{
+  const double window_scale_factor = context->GetContentScaleFactor();
+  if (window_scale_factor != 1.0)
+  {
+    output_size *= window_scale_factor;
+    usable_rect.SetPosition(usable_rect.GetPosition() * window_scale_factor);
+    usable_rect.SetSize(usable_rect.GetSize() * window_scale_factor);
+  }
+  const double scale_factor = (context->FromDIP(1024) / 1024.0) * window_scale_factor;
+
+  return wxBitmap(
+      ScaleImage(image, source_scale, scale_factor, output_size, usable_rect, flags, fill_color),
+      wxBITMAP_SCREEN_DEPTH, window_scale_factor);
+}
+
 wxBitmap ScaleImageToBitmap(const wxImage& image, const wxWindow* context,
                             const wxSize& output_size, const wxRect& usable_rect, LSIFlags flags,
                             const wxColour& fill_color)
 {
-  double scale_factor = context->GetContentScaleFactor();
-  return wxBitmap(ScaleImage(image, 1.0, scale_factor, output_size, usable_rect, flags, fill_color),
-                  wxBITMAP_SCREEN_DEPTH, scale_factor);
+  return ScaleImageToBitmap(image, context, 1.0, output_size, usable_rect, flags, fill_color);
 }
 
 wxBitmap ScaleImageToBitmap(const wxImage& image, const wxWindow* context, double source_scale,
                             LSIFlags flags, const wxColour& fill_color)
 {
-  double scale_factor = context->GetContentScaleFactor();
-  return wxBitmap(ScaleImage(image, source_scale, scale_factor, wxDefaultSize, wxDefaultSize, flags,
-                             fill_color),
-                  wxBITMAP_SCREEN_DEPTH, scale_factor);
+  return ScaleImageToBitmap(image, context, source_scale, wxDefaultSize, wxDefaultSize, flags,
+                            fill_color);
 }
 
 wxImage ScaleImage(wxImage image, double source_scale_factor, double content_scale_factor,
@@ -422,13 +444,8 @@ wxImage ScaleImage(wxImage image, double source_scale_factor, double content_sca
     wxFAIL_MSG("WxUtils::ScaleImage expects a valid image.");
     return image;
   }
-
-  if (content_scale_factor != 1.0)
-  {
-    output_size *= content_scale_factor;
-    usable_rect.SetPosition(usable_rect.GetPosition() * content_scale_factor);
-    usable_rect.SetSize(usable_rect.GetSize() * content_scale_factor);
-  }
+  wxASSERT_MSG(source_scale_factor > 0 && content_scale_factor > 0,
+               "Scaling factors must be positive and greater than zero");
 
   // Fix the output size if it's unset.
   wxSize img_size = image.GetSize();

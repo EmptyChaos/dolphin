@@ -133,9 +133,9 @@ wxBitmap ScaleImageToBitmap(const wxImage& image, const wxWindow* context, doubl
 
 // Internal scaling engine behind all the Scaling functions.
 // Exposes all control parameters instead of infering them from other sources.
-// "Content scale" is a factor applied to output_size and usable_rect internally to convert them
-// to framebuffer pixel sizes.
-// NOTE: Source scale factor only matters if you don't explicitly specify the output size.
+// Source and content scale only matters if you don't explicitly specify the output size,
+// they cause automatic scaling adjustments based on the DPI ratio between the input and output
+// e.g. source = 1.5, content = 2: scaling = 1.333...
 wxImage ScaleImage(wxImage image, double source_scale_factor = 1.0,
                    double content_scale_factor = 1.0, wxSize output_size = wxDefaultSize,
                    wxRect usable_rect = wxDefaultSize, LSIFlags flags = LSI_DEFAULT,
