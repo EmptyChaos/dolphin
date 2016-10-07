@@ -460,9 +460,6 @@ void CCodeWindow::OnSymbolsMenu(wxCommandEvent& event)
 
 void CCodeWindow::NotifyMapLoaded()
 {
-  if (!codeview)
-    return;
-
   g_symbolDB.FillInCallers();
   symbols->Freeze();  // HyperIris: wx style fast filling
   symbols->Clear();

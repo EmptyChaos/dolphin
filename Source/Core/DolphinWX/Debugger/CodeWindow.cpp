@@ -385,8 +385,7 @@ void CCodeWindow::ToggleBreakpoint()
 {
   if (CPU::IsStepping())
   {
-    if (codeview)
-      codeview->ToggleBreakpoint(codeview->GetSelection());
+    codeview->ToggleBreakpoint(codeview->GetSelection());
   }
 }
 
@@ -707,9 +706,6 @@ void CCodeWindow::PopulateToolbar(wxToolBar* toolBar)
 // Update GUI
 void CCodeWindow::Repopulate(bool everything)
 {
-  if (!codeview)
-    return;
-
   if (everything)
     codeview->Refresh();
   UpdateCallstack();
