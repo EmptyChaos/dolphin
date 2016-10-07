@@ -433,24 +433,25 @@ void CCodeWindow::UpdateLists()
 
 void CCodeWindow::UpdateCallstack()
 {
-  if (Core::GetState() == Core::CORE_STOPPING)
-    return;
-
   callstack->Freeze();
   callstack->Clear();
 
-  std::vector<Dolphin_Debugger::CallstackEntry> stack;
-
-  bool ret = Dolphin_Debugger::GetCallstack(stack);
-
-  for (auto& frame : stack)
+  if (CPU::IsStepping())
   {
-    int idx = callstack->Append(StrToWxStr(frame.Name));
-    callstack->SetClientData(idx, (void*)(u64)frame.vAddress);
+    std::vector<Dolphin_Debugger::CallstackEntry> stack;
+
+    bool ret = Dolphin_Debugger::GetCallstack(stack);
+
+    for (auto& frame : stack)
+    {
+      int idx = callstack->Append(StrToWxStr(frame.Name));
+      callstack->SetClientData(idx, (void*)(u64)frame.vAddress);
+    }
+
+    if (!ret)
+      callstack->Append(StrToWxStr("invalid callstack"));
   }
 
-  if (!ret)
-    callstack->Append(StrToWxStr("invalid callstack"));
   callstack->Thaw();
 }
 
