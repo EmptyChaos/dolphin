@@ -831,13 +831,16 @@ void CFrame::OnPlay(wxCommandEvent& WXUNUSED(event))
     // Core is initialized and emulator is running
     if (UseDebugger)
     {
-      CPU::EnableStepping(!CPU::IsStepping());
+      bool was_stepping = CPU::IsStepping();
+      CPU::EnableStepping(!was_stepping);
 
-      wxThread::Sleep(20);
-      g_pCodeWindow->JumpToAddress(PC);
-      g_pCodeWindow->Repopulate();
-      // Update toolbar with Play/Pause status
-      UpdateGUI();
+      // IDM_UPDATE_DISASM_DIALOG will be sent from the CPU when it stops, we only need
+      // to refresh the UI when starting up.
+      if (was_stepping)
+      {
+        g_pCodeWindow->Repopulate();
+        UpdateGUI();
+      }
     }
     else
     {
@@ -1139,7 +1142,14 @@ void CFrame::DoStop()
       if (Ret != wxID_YES)
       {
         if (should_pause)
+        {
           Core::SetState(state);
+
+          // The Debugger was informed of the pause by the CPU subsystem, we need to tell
+          // it to forget what it saw.
+          if (g_pCodeWindow && state == Core::CORE_RUN)
+            g_pCodeWindow->Repopulate();
+        }
 
         m_confirmStop = false;
         return;

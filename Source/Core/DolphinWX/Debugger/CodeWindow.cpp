@@ -159,7 +159,8 @@ void CCodeWindow::OnHostMessage(wxCommandEvent& event)
     break;
 
   case IDM_UPDATE_DISASM_DIALOG:
-    Repopulate();
+    Repopulate(false);
+    codeview->Center(PC);
     if (HasPanel<CRegisterWindow>())
       GetPanel<CRegisterWindow>()->NotifyUpdate();
     if (HasPanel<CWatchWindow>())
@@ -205,36 +206,23 @@ void CCodeWindow::OnCodeStep(wxCommandEvent& event)
 
   case IDM_SKIP:
     PC += 4;
-    Repopulate();
+    JumpToAddress(PC);
     break;
 
   case IDM_SETPC:
     PC = codeview->GetSelection();
-    Repopulate();
-    break;
+  // fallthrough
 
   case IDM_GOTOPC:
     JumpToAddress(PC);
     break;
   }
-
-  UpdateButtonStates();
-  // Update all toolbars in the aui manager
-  Parent->UpdateGUI();
 }
 
-bool CCodeWindow::JumpToAddress(u32 address)
+void CCodeWindow::JumpToAddress(u32 address)
 {
-  // Jump to anywhere in memory
-  if (address <= 0xFFFFFFFF)
-  {
-    codeview->Center(address);
-    UpdateLists();
-
-    return true;
-  }
-
-  return false;
+  codeview->Center(address);
+  UpdateLists();
 }
 
 void CCodeWindow::OnCodeViewChange(wxCommandEvent& event)
@@ -249,19 +237,16 @@ void CCodeWindow::OnAddrBoxChange(wxCommandEvent& event)
   // Trim leading and trailing whitespace.
   wxString txt = pAddrCtrl->GetValue().Trim().Trim(false);
 
-  bool success = false;
   unsigned long addr;
   if (txt.ToULong(&addr, 16))
   {
-    if (JumpToAddress(addr))
-      success = true;
-  }
-
-  if (success)
     pAddrCtrl->SetBackgroundColour(wxNullColour);
+    JumpToAddress(static_cast<u32>(addr));
+  }
   else if (!txt.empty())
+  {
     pAddrCtrl->SetBackgroundColour(*wxRED);
-
+  }
   pAddrCtrl->Refresh();
 
   event.Skip();
@@ -322,8 +307,14 @@ void CCodeWindow::StepOver()
     if (inst.LK)
     {
       PowerPC::breakpoints.ClearAllTemporary();
-      PowerPC::breakpoints.Add(PC + 4, true);
+      u32 bp = PC + 4;
+      PowerPC::breakpoints.Add(bp, true);
       CPU::EnableStepping(false);
+      // NOTE: There's a race here since the CPU can stop again at any time
+      JumpToAddress(bp);
+      Repopulate(false);
+      // Update all toolbars in the aui manager
+      Parent->UpdateGUI();
     }
     else
     {
@@ -383,14 +374,10 @@ void CCodeWindow::StepOut()
     PowerPC::SetMode(old_mode);
     CPU::PauseAndLock(false, false);
 
-    JumpToAddress(PC);
     {
       wxCommandEvent ev(wxEVT_HOST_COMMAND, IDM_UPDATE_DISASM_DIALOG);
       GetEventHandler()->ProcessEvent(ev);
     }
-
-    // Update all toolbars in the aui manager
-    Parent->UpdateGUI();
   }
 }
 
@@ -400,42 +387,49 @@ void CCodeWindow::ToggleBreakpoint()
   {
     if (codeview)
       codeview->ToggleBreakpoint(codeview->GetSelection());
-    Repopulate();
   }
 }
 
 void CCodeWindow::UpdateLists()
 {
-  callers->Clear();
   u32 addr = codeview->GetSelection();
   Symbol* symbol = g_symbolDB.GetSymbolFromAddr(addr);
-  if (!symbol)
-    return;
 
-  for (auto& call : symbol->callers)
+  callers->Freeze();
+  callers->Clear();
+  if (symbol)
   {
-    u32 caller_addr = call.callAddress;
-    Symbol* caller_symbol = g_symbolDB.GetSymbolFromAddr(caller_addr);
-    if (caller_symbol)
+    for (auto& call : symbol->callers)
     {
-      int idx = callers->Append(StrToWxStr(
-          StringFromFormat("< %s (%08x)", caller_symbol->name.c_str(), caller_addr).c_str()));
-      callers->SetClientData(idx, (void*)(u64)caller_addr);
+      u32 caller_addr = call.callAddress;
+      Symbol* caller_symbol = g_symbolDB.GetSymbolFromAddr(caller_addr);
+      if (caller_symbol)
+      {
+        int idx = callers->Append(StrToWxStr(
+            StringFromFormat("< %s (%08x)", caller_symbol->name.c_str(), caller_addr).c_str()));
+        callers->SetClientData(idx, (void*)(u64)caller_addr);
+      }
     }
   }
+  callers->Thaw();
 
+  calls->Freeze();
   calls->Clear();
-  for (auto& call : symbol->calls)
+  if (symbol)
   {
-    u32 call_addr = call.function;
-    Symbol* call_symbol = g_symbolDB.GetSymbolFromAddr(call_addr);
-    if (call_symbol)
+    for (auto& call : symbol->calls)
     {
-      int idx = calls->Append(StrToWxStr(
-          StringFromFormat("> %s (%08x)", call_symbol->name.c_str(), call_addr).c_str()));
-      calls->SetClientData(idx, (void*)(u64)call_addr);
+      u32 call_addr = call.function;
+      Symbol* call_symbol = g_symbolDB.GetSymbolFromAddr(call_addr);
+      if (call_symbol)
+      {
+        int idx = calls->Append(StrToWxStr(
+            StringFromFormat("> %s (%08x)", call_symbol->name.c_str(), call_addr).c_str()));
+        calls->SetClientData(idx, (void*)(u64)call_addr);
+      }
     }
   }
+  calls->Thaw();
 }
 
 void CCodeWindow::UpdateCallstack()
@@ -443,6 +437,7 @@ void CCodeWindow::UpdateCallstack()
   if (Core::GetState() == Core::CORE_STOPPING)
     return;
 
+  callstack->Freeze();
   callstack->Clear();
 
   std::vector<Dolphin_Debugger::CallstackEntry> stack;
@@ -457,6 +452,7 @@ void CCodeWindow::UpdateCallstack()
 
   if (!ret)
     callstack->Append(StrToWxStr("invalid callstack"));
+  callstack->Thaw();
 }
 
 // Create CPU Mode menus
@@ -709,12 +705,13 @@ void CCodeWindow::PopulateToolbar(wxToolBar* toolBar)
 }
 
 // Update GUI
-void CCodeWindow::Repopulate()
+void CCodeWindow::Repopulate(bool everything)
 {
   if (!codeview)
     return;
 
-  codeview->Center(PC);
+  if (everything)
+    codeview->Refresh();
   UpdateCallstack();
   UpdateButtonStates();
 
@@ -782,10 +779,13 @@ void CCodeWindow::UpdateButtonStates()
   GetMenuBar()->Enable(IDM_USE_SIGNATURE_FILE, Initialized);
   GetMenuBar()->Enable(IDM_PATCH_HLE_FUNCTIONS, Initialized);
 
-  // Update Fonts
-  callstack->SetFont(DebuggerFont);
-  symbols->SetFont(DebuggerFont);
-  callers->SetFont(DebuggerFont);
-  calls->SetFont(DebuggerFont);
-  m_aui_manager.GetArtProvider()->SetFont(wxAUI_DOCKART_CAPTION_FONT, DebuggerFont);
+  // Update Fonts (only when it changes to avoid extra Refresh()es)
+  if (callstack->GetFont() != DebuggerFont)
+  {
+    callstack->SetFont(DebuggerFont);
+    symbols->SetFont(DebuggerFont);
+    callers->SetFont(DebuggerFont);
+    calls->SetFont(DebuggerFont);
+    m_aui_manager.GetArtProvider()->SetFont(wxAUI_DOCKART_CAPTION_FONT, DebuggerFont);
+  }
 }

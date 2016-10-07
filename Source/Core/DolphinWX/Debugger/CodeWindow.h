@@ -93,9 +93,9 @@ public:
   bool AutomaticStart();
   bool JITNoBlockCache();
   bool JITNoBlockLinking();
-  bool JumpToAddress(u32 address);
+  void JumpToAddress(u32 address);
 
-  void Repopulate();
+  void Repopulate(bool everything = true);
   void NotifyMapLoaded();
   void CreateMenu(const SConfig& _LocalCoreStartupParameter, wxMenuBar* pMenuBar);
   void CreateMenuOptions(wxMenu* pMenu);
