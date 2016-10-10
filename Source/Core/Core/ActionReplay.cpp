@@ -20,7 +20,6 @@
 // -------------------------------------------------------------------------------------------------------------
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <iterator>
 #include <mutex>
@@ -74,8 +73,9 @@ enum DataType
 static std::mutex s_lock;
 static std::vector<ARCode> s_active_codes;
 static std::vector<std::string> s_internal_log;
-static std::atomic<bool> s_use_internal_log{false};
-static bool s_disable_logging = false;
+static bool s_use_internal_log = false;
+static u32 s_code_list_version = 0;
+static u32 s_last_code_list_version = 0;
 
 struct ARAddr
 {
@@ -125,10 +125,11 @@ struct ARAddr
 void ApplyCodes(const std::vector<ARCode>& codes)
 {
   std::lock_guard<std::mutex> guard(s_lock);
-  s_disable_logging = false;
   s_active_codes.clear();
+  ++s_code_list_version;
   if (SConfig::GetInstance().bEnableCheats)
   {
+    s_active_codes.reserve(codes.size());
     std::copy_if(codes.begin(), codes.end(), std::back_inserter(s_active_codes),
                  [](const ARCode& code) { return code.active && !code.ops.empty(); });
   }
@@ -143,7 +144,6 @@ void AddCode(ARCode code)
   if (code.active)
   {
     std::lock_guard<std::mutex> guard(s_lock);
-    s_disable_logging = false;
     s_active_codes.emplace_back(std::move(code));
   }
 }
@@ -288,30 +288,10 @@ void SaveCodes(IniFile* local_ini, const std::vector<ARCode>& codes)
   local_ini->SetLines("ActionReplay", lines);
 }
 
-static void LogInfo(const char* format, ...)
-{
-  if (s_disable_logging)
-    return;
-  bool use_internal_log = s_use_internal_log.load(std::memory_order_relaxed);
-  if (!use_internal_log)
-    return;
-
-  va_list args;
-  va_start(args, format);
-  std::string text = StringFromFormatV(format, args);
-  va_end(args);
-  INFO_LOG(ACTIONREPLAY, "%s", text.c_str());
-
-  if (use_internal_log)
-  {
-    text += '\n';
-    s_internal_log.emplace_back(std::move(text));
-  }
-}
-
 void EnableSelfLogging(bool enable)
 {
-  s_use_internal_log.store(enable, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> guard(s_lock);
+  s_use_internal_log = enable;
 }
 
 std::vector<std::string> GetSelfLog()
@@ -328,7 +308,8 @@ void ClearSelfLog()
 
 bool IsSelfLogging()
 {
-  return s_use_internal_log.load(std::memory_order_relaxed);
+  std::lock_guard<std::mutex> guard(s_lock);
+  return s_use_internal_log;
 }
 
 // ----------------------
@@ -438,8 +419,17 @@ enum class Instruction
 class ExecutionEngine
 {
 public:
-  explicit ExecutionEngine(const ARCode& code, bool flush_icache = false)
-      : m_code(code), m_flush_icache(flush_icache)
+  enum class Logging
+  {
+    None,
+    InfoLog,
+    InternalLog,
+    All
+  };
+
+  explicit ExecutionEngine(const ARCode& code, Logging log_mode = Logging::None,
+                           bool flush_icache = false)
+      : m_code(code), m_use_log(log_mode), m_flush_icache(flush_icache)
   {
   }
 
@@ -472,6 +462,14 @@ public:
     return true;
   }
 
+  void TransferInternalLog(std::vector<std::string>* out_log)
+  {
+    out_log->reserve(out_log->size() + m_log.size() + 1);
+    std::move(m_log.begin(), m_log.end(), std::back_inserter(*out_log));
+    m_log.clear();
+    out_log->emplace_back("\n");
+  }
+
 private:
   using InstructionFunc = bool (ExecutionEngine::*)(ARAddr, u32);
 
@@ -496,6 +494,8 @@ private:
   std::pair<bool, u32> ReadPointer(u32 pointer) const;
   bool DoWriteToRAM(u32 address, u32 value, DataType type);
   bool DoMemcpy(u32 dest, u32 source, u32 length);
+  bool CompareValues(const u32 val1, const u32 val2, const int type) const;
+  void LogInfo(const char* format, ...) const;
 
   // Action Replay Instructions
   bool UnknownInstruction(ARAddr, u32);
@@ -513,6 +513,9 @@ private:
   bool Memcpy(ARAddr, u32);
   bool MemcpyIndirect(ARAddr, u32);
 
+  mutable std::vector<std::string> m_log;
+  Logging m_use_log = Logging::None;
+
   const ARCode& m_code;
   std::size_t m_ARPC = 0;           // Action Replay Program Counter
   std::size_t m_ARNPC = 0;          // Action Replay Next Program Counter
@@ -523,6 +526,25 @@ private:
   // (e.g. button codes).
   bool m_flush_icache = false;
 };
+
+void ExecutionEngine::LogInfo(const char* format, ...) const
+{
+  if (m_use_log == Logging::None)
+    return;
+
+  va_list args;
+  va_start(args, format);
+  std::string s = StringFromFormatV(format, args);
+  if (m_use_log != Logging::InternalLog)
+    INFO_LOG(ACTIONREPLAY, "%s", s.c_str());
+  va_end(args);
+
+  if (m_use_log != Logging::InfoLog)
+  {
+    s += '\n';
+    m_log.push_back(std::move(s));
+  }
+}
 
 ExecutionEngine::InstructionAnalysis ExecutionEngine::AnalyzeInstruction(std::size_t idx) const
 {
@@ -943,7 +965,7 @@ bool ExecutionEngine::Addition(ARAddr addr, u32 data)
   return true;
 }
 
-static bool CompareValues(const u32 val1, const u32 val2, const int type)
+bool ExecutionEngine::CompareValues(const u32 val1, const u32 val2, const int type) const
 {
   bool result = false;
   switch (type)
@@ -1262,19 +1284,47 @@ void RunAllActive()
   if (!SConfig::GetInstance().bEnableCheats)
     return;
 
-  // If the mutex is idle then acquiring it should be cheap, fast mutexes
-  // are only atomic ops unless contested. It should be rare for this to
-  // be contested.
-  std::lock_guard<std::mutex> guard(s_lock);
-  s_active_codes.erase(std::remove_if(s_active_codes.begin(), s_active_codes.end(),
-                                      [](const ARCode& code) {
-                                        ExecutionEngine engine{code, !s_disable_logging};
-                                        bool success = engine.Execute();
-                                        LogInfo("\n");
-                                        return !success;
-                                      }),
-                       s_active_codes.end());
-  s_disable_logging = true;
+  // Because there are PanicAlerts in the engine, there's a risk of deadlocking the GUI so we
+  // have to run the engine outside the lock.
+  std::unique_lock<std::mutex> lk(s_lock);
+
+  // Since we modify the code list, we need to make it thread local so that will be safe
+  std::vector<ARCode> code_list(std::move(s_active_codes));
+  bool first_run = s_last_code_list_version != s_code_list_version;
+  s_last_code_list_version = s_code_list_version;
+
+  // Decide what logging scheme to use
+  ExecutionEngine::Logging log_mode = ExecutionEngine::Logging::None;
+  if (first_run)
+    log_mode =
+        s_use_internal_log ? ExecutionEngine::Logging::All : ExecutionEngine::Logging::InfoLog;
+
+  lk.unlock();
+
+  std::vector<std::string> log;
+  code_list.erase(std::remove_if(code_list.begin(), code_list.end(),
+                                 [&](const ARCode& code) {
+                                   ExecutionEngine engine{code, log_mode, first_run};
+                                   bool success = engine.Execute();
+                                   engine.TransferInternalLog(&log);
+                                   return !success;
+                                 }),
+                  code_list.end());
+
+  lk.lock();
+  if (s_use_internal_log)
+  {
+    // Append this log to the global log
+    s_internal_log.reserve(s_internal_log.size() + log.size());
+    std::move(log.begin(), log.end(), std::back_inserter(s_internal_log));
+  }
+  if (s_code_list_version == s_last_code_list_version)
+  {
+    std::swap(s_active_codes, code_list);
+    // In case of AddCode() calls
+    if (!code_list.empty())
+      std::move(code_list.begin(), code_list.end(), std::back_inserter(s_active_codes));
+  }
 }
 
 }  // namespace ActionReplay
