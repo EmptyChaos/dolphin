@@ -17,9 +17,7 @@
 #include "DolphinWX/Debugger/MemoryWindow.h"
 #include "DolphinWX/Debugger/RegisterView.h"
 #include "DolphinWX/Debugger/WatchWindow.h"
-#include "DolphinWX/Frame.h"
 #include "DolphinWX/Globals.h"
-#include "DolphinWX/Main.h"
 #include "DolphinWX/WxUtils.h"
 
 // F-zero 80005e60 wtf??
@@ -508,59 +506,67 @@ void CRegisterView::OnMouseDownR(wxGridEvent& event)
 
 void CRegisterView::OnPopupMenu(wxCommandEvent& event)
 {
-  // FIXME: This is terrible. Generate events instead.
-  CFrame* cframe = wxGetApp().GetCFrame();
-  CCodeWindow* code_window = cframe->g_pCodeWindow;
-  CWatchWindow* watch_window = code_window->GetPanel<CWatchWindow>();
-  CMemoryWindow* memory_window = code_window->GetPanel<CMemoryWindow>();
-
+  DebuggerUpdateType type = DebuggerUpdateType::MoveCodePointer;
+  bool need_update = false;
   switch (event.GetId())
   {
   case IDM_WATCHADDRESS:
     PowerPC::watches.Add(m_selectedAddress);
-    if (watch_window)
-      watch_window->NotifyUpdate();
-    Refresh();
+    type = DebuggerUpdateType::UpdateWatchPoints;
+    need_update = true;
     break;
+
   case IDM_VIEWMEMORY:
-    if (memory_window)
-      memory_window->JumpToAddress(m_selectedAddress);
-    Refresh();
+    type = DebuggerUpdateType::MoveMemoryPointer;
+    need_update = true;
     break;
+
   case IDM_VIEWCODE:
-    code_window->JumpToAddress(m_selectedAddress);
-    Refresh();
+    type = DebuggerUpdateType::MoveCodePointer;
+    need_update = true;
     break;
+
   case IDM_VIEW_HEX8:
     m_register_table->SetRegisterFormat(m_selectedColumn, m_selectedRow,
                                         CRegTable::FormatSpecifier::Hex8);
-    Refresh();
     break;
+
   case IDM_VIEW_HEX16:
     m_register_table->SetRegisterFormat(m_selectedColumn, m_selectedRow,
                                         CRegTable::FormatSpecifier::Hex16);
-    Refresh();
     break;
+
   case IDM_VIEW_INT:
     m_register_table->SetRegisterFormat(m_selectedColumn, m_selectedRow,
                                         CRegTable::FormatSpecifier::Int);
-    Refresh();
     break;
+
   case IDM_VIEW_UINT:
     m_register_table->SetRegisterFormat(m_selectedColumn, m_selectedRow,
                                         CRegTable::FormatSpecifier::UInt);
-    Refresh();
     break;
+
   case IDM_VIEW_FLOAT:
     m_register_table->SetRegisterFormat(m_selectedColumn, m_selectedRow,
                                         CRegTable::FormatSpecifier::Float);
-    Refresh();
     break;
+
   case IDM_VIEW_DOUBLE:
     m_register_table->SetRegisterFormat(m_selectedColumn, m_selectedRow,
                                         CRegTable::FormatSpecifier::Double);
-    Refresh();
     break;
+
+  default:
+    event.Skip();
+    return;
   }
-  event.Skip();
+  Refresh();
+
+  if (need_update)
+  {
+    wxCommandEvent ev(DOLPHIN_EVT_DEBUGGER_UPDATE_STATE, GetId());
+    ev.SetInt(static_cast<int>(type));
+    ev.SetExtraLong(m_selectedAddress);
+    GetEventHandler()->ProcessEvent(ev);
+  }
 }

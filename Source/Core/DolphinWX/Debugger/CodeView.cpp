@@ -26,6 +26,7 @@
 #include "Core/Core.h"
 #include "Core/Host.h"
 #include "DolphinWX/Debugger/CodeView.h"
+#include "DolphinWX/Debugger/CodeWindow.h"
 #include "DolphinWX/Debugger/DebuggerUIUtil.h"
 #include "DolphinWX/Globals.h"
 #include "DolphinWX/WxUtils.h"
@@ -129,9 +130,10 @@ void CCodeView::ToggleBreakpoint(u32 address)
   m_debugger->ToggleBreakpoint(address);
   Refresh();
 
-  // Propagate back to the parent window to update the breakpoint list.
-  wxCommandEvent evt(wxEVT_HOST_COMMAND, IDM_UPDATE_BREAKPOINTS);
-  GetEventHandler()->AddPendingEvent(evt);
+  // Refresh other views
+  wxCommandEvent ev(DOLPHIN_EVT_DEBUGGER_UPDATE_STATE, GetId());
+  ev.SetInt(static_cast<int>(DebuggerUpdateType::UpdateBreakPoints));
+  GetEventHandler()->ProcessEvent(ev);
 }
 
 void CCodeView::OnMouseMove(wxMouseEvent& event)
@@ -302,8 +304,10 @@ void CCodeView::OnPopupMenu(wxCommandEvent& event)
   {
     // Propagate back to the parent window and tell it
     // to flip to the JIT tab for the current address.
-    wxCommandEvent jit_event(wxEVT_HOST_COMMAND, IDM_UPDATE_JIT_PANE);
-    GetEventHandler()->AddPendingEvent(jit_event);
+    wxCommandEvent ev(DOLPHIN_EVT_DEBUGGER_UPDATE_STATE, GetId());
+    ev.SetInt(static_cast<int>(DebuggerUpdateType::DisplayJitBreakdown));
+    ev.SetExtraLong(m_selection);
+    GetEventHandler()->ProcessEvent(ev);
   }
   break;
 

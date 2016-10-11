@@ -307,6 +307,7 @@ private:
   void OnFocusChange(wxFocusEvent& event);
 
   void OnHostMessage(wxCommandEvent& event);
+  void OnDebuggerStateUpdate(wxCommandEvent&);
 
   void OnMemcard(wxCommandEvent& event);  // Misc
   void OnImportSave(wxCommandEvent& event);
