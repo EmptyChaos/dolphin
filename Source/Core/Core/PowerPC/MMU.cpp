@@ -646,6 +646,20 @@ bool HostIsRAMAddress(u32 address)
   return false;
 }
 
+bool HostIsRAMAddress(const u32 address, const u32 length)
+{
+  // Smallest possible alignment unit for the MMU is the Page Size
+  // We need to check every page in the range maps to a RAM Address
+  static constexpr u32 PAGE_MASK = ~(HW_PAGE_SIZE - 1);
+  const u32 end = (address + length + HW_PAGE_SIZE - 1) & PAGE_MASK;
+  for (u32 ptr = address & PAGE_MASK; ptr < end; ptr += HW_PAGE_SIZE)
+  {
+    if (!HostIsRAMAddress(ptr))
+      return false;
+  }
+  return true;
+}
+
 void DMA_LCToMemory(const u32 memAddr, const u32 cacheAddr, const u32 numBlocks)
 {
   // TODO: It's not completely clear this is the right spot for this code;

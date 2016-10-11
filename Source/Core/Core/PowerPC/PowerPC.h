@@ -219,7 +219,10 @@ void HostWrite_U64(const u64 var, const u32 address);
 
 // Returns whether a read or write to the given address will resolve to a RAM
 // access given the current CPU state.
+// NOTE: Non-length version must have address aligned to the size you intend to read/write.
+//   e.g. address = 0xFFF will only guarantee 1 byte before you cross a page boundary.
 bool HostIsRAMAddress(const u32 address);
+bool HostIsRAMAddress(const u32 address, const u32 length);
 
 std::string HostGetString(u32 em_address, size_t size = 0);
 
