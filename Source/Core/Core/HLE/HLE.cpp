@@ -75,6 +75,7 @@ static const SPatch OSPatches[] = {
     {"GeckoCodehandler", HLE_Misc::GeckoCodeHandlerICacheFlush, HLE_HOOK_START, HLE_TYPE_FIXED},
     {"GeckoHandlerReturnTrampoline", HLE_Misc::GeckoReturnTrampoline, HLE_HOOK_REPLACE,
      HLE_TYPE_FIXED},
+    {"GeckoWriteICacheHook", HLE_Misc::GeckoWriteICacheFlush, HLE_HOOK_START, HLE_TYPE_FIXED},
 };
 
 static const SPatch OSBreakPoints[] = {

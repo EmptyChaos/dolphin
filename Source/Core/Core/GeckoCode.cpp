@@ -3,6 +3,7 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#include <array>
 #include <iterator>
 #include <mutex>
 #include <tuple>
@@ -14,6 +15,7 @@
 
 #include "Core/ConfigManager.h"
 #include "Core/GeckoCode.h"
+#include "Core/HLE/HLE.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/PowerPC.h"
 
@@ -56,10 +58,25 @@ enum class Installation
   Failed
 };
 
+// _write function (Handler for 00XXXXXX -> 0CXXXXXX)
+static constexpr std::array<u32, 7> WRITE_SIGNATURE{{
+    0x7D8C1A14,  // add   r12, r12, r3
+    0x2C050003,  // cmpwi r5, 3
+    0x41820048,  // beq-  _write_string
+    0x41810060,  // bgt-  _write_serial
+    0x40BEFF84,  // bne-  cr7, _readcodes
+    0x2E050001,  // cmpwi cr4, r5, 1
+    0x4191002C,  // bgt-  cr4, _write32
+}};
+static constexpr std::array<u32, 7> WRITE_SIGNATURE_MASK{
+    {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFF0003, 0xFFFF0003, 0xFFFF0003, 0xFFFFFFFF, 0xFFFF0003}};
+
 static Installation s_code_handler_installed = Installation::Uninstalled;
 // the currently active codes
 static std::vector<GeckoCode> s_active_codes;
 static std::mutex s_active_codes_lock;
+static u32 s_hook_address;
+static bool s_hook_installed = false;
 
 void SetActiveCodes(const std::vector<GeckoCode>& gcodes)
 {
@@ -76,6 +93,56 @@ void SetActiveCodes(const std::vector<GeckoCode>& gcodes)
 
   s_code_handler_installed = Installation::Uninstalled;
 }
+
+// Pattern matcher for finding a specific code block
+class SignatureScanner final
+{
+public:
+  SignatureScanner(const u32* signature, std::size_t length, const u32* mask = nullptr)
+      : m_signature(signature), m_mask(mask), m_end(length)
+  {
+  }
+
+  template <std::size_t N>
+  SignatureScanner(const std::array<u32, N>& signature, const std::array<u32, N>& mask)
+      : SignatureScanner(signature.data(), N, mask.data())
+  {
+    static_assert(N > 0, "Array cannot be empty");
+  }
+
+  void Scan(u32 item, u32 pos)
+  {
+    u32 mask = m_mask ? m_mask[m_i] : UINT32_MAX;
+    if (((item ^ m_signature[m_i]) & mask) == 0)
+    {
+      if (m_start_pos == -1)
+        m_start_pos = pos;
+
+      ++m_i;
+      if (m_i == m_end)
+      {
+        m_pos = m_start_pos;
+        m_start_pos = -1;
+        m_i = 0;
+      }
+    }
+    else
+    {
+      m_i = 0;
+      m_start_pos = -1;
+    }
+  }
+
+  bool HasMatch() const { return m_pos > -1; }
+  u32 GetLastMatch() const { return static_cast<u32>(m_pos); }
+private:
+  const u32* m_signature;
+  const u32* m_mask = nullptr;
+  const std::size_t m_end;
+  std::size_t m_i = 0;
+  s64 m_pos = -1;
+  s64 m_start_pos = -1;
+};
 
 // Requires s_active_codes_lock
 // NOTE: Refer to "codehandleronly.s" from Gecko OS.
@@ -104,15 +171,48 @@ static Installation InstallCodeHandlerLocked()
   for (u32 i = 0; i < data.size(); ++i)
     PowerPC::HostWrite_U8(data[i], INSTALLER_BASE_ADDRESS + i);
 
+  // If reinstalling then disconnect the existing hook
+  if (s_hook_installed)
+  {
+    s_hook_installed = false;
+    HLE::UnPatch(s_hook_address, "GeckoWriteICacheHook");
+    s_hook_address = 0;
+  }
+
   // Patch the code handler to the current system type (Gamecube/Wii)
+  SignatureScanner write_scanner{WRITE_SIGNATURE, WRITE_SIGNATURE_MASK};
   for (unsigned int h = 0; h < data.length(); h += 4)
   {
+    u32 instruction = PowerPC::HostRead_U32(INSTALLER_BASE_ADDRESS + h);
     // Patch MMIO address
-    if (PowerPC::HostRead_U32(INSTALLER_BASE_ADDRESS + h) == (0x3f000000u | ((mmio_addr ^ 1) << 8)))
+    if (instruction == (0x3f000000u | ((mmio_addr ^ 1) << 8)))
     {
-      NOTICE_LOG(ACTIONREPLAY, "Patching MMIO access at %08x", INSTALLER_BASE_ADDRESS + h);
+      NOTICE_LOG(ACTIONREPLAY, "GCH: Patched MMIO access at %08x", INSTALLER_BASE_ADDRESS + h);
       PowerPC::HostWrite_U32(0x3f000000u | mmio_addr << 8, INSTALLER_BASE_ADDRESS + h);
     }
+
+    write_scanner.Scan(instruction, INSTALLER_BASE_ADDRESS + h);
+  }
+
+  // Install the ICache hook
+  if (write_scanner.HasMatch())
+  {
+    auto translated = HLE::Patch(write_scanner.GetLastMatch(), "GeckoWriteICacheHook");
+    if (translated.valid)
+    {
+      s_hook_address = translated.address;
+      s_hook_installed = true;
+      NOTICE_LOG(ACTIONREPLAY, "GCH: ICache Hook installed at %08X (@%08X)",
+                 write_scanner.GetLastMatch(), s_hook_address);
+    }
+    else
+    {
+      ERROR_LOG(ACTIONREPLAY, "GCH: Address translation failed %08X", write_scanner.GetLastMatch());
+    }
+  }
+  else
+  {
+    ERROR_LOG(ACTIONREPLAY, "GCH: Could not find \"_write\". Button codes won't work.");
   }
 
   const u32 codelist_base_address =
@@ -180,7 +280,21 @@ static Installation InstallCodeHandlerLocked()
 void DoState(PointerWrap& p)
 {
   std::lock_guard<std::mutex> codes_lock(s_active_codes_lock);
+  if (p.GetMode() == PointerWrap::MODE_READ && s_hook_installed)
+  {
+    HLE::UnPatch(s_hook_address, "GeckoWriteICacheHook");
+  }
+
   p.Do(s_code_handler_installed);
+  p.Do(s_hook_installed);
+  p.Do(s_hook_address);
+
+  if (p.GetMode() == PointerWrap::MODE_READ && s_hook_installed)
+  {
+    HLE::PatchPhysical(s_hook_address, "GeckoWriteICacheHook");
+    NOTICE_LOG(ACTIONREPLAY, "GCH: Loaded Hook from savestate: %08X", s_hook_address);
+  }
+
   // FIXME: The active codes list will disagree with the embedded GCT
 }
 
@@ -189,6 +303,8 @@ void Shutdown()
   std::lock_guard<std::mutex> codes_lock(s_active_codes_lock);
   s_active_codes.clear();
   s_code_handler_installed = Installation::Uninstalled;
+  s_hook_address = 0;
+  s_hook_installed = false;
 }
 
 void RunCodeHandler()

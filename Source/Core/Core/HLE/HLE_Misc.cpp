@@ -57,6 +57,64 @@ void GeckoCodeHandlerICacheFlush()
   PowerPC::ppcState.iCache.Reset();
 }
 
+// _write function in the Gecko Code Handler. (HLE_HOOK_START)
+// This hook is needed because Dolphin retains compiled JIT blocks more aggressively than the
+// real CPU instruction cache on the GC/Wii. This means cheats that modify instructions differently
+// over time (i.e. button conditional codes) don't work in Dolphin because the JIT ignores changes.
+void GeckoWriteICacheFlush()
+{
+  // See _write in Gecko OS codehandleronly.s
+  // r3 contains the pointer offset, r12 contains the base pointer,
+  // r5 contains the subtype, r4 contains the second code word,
+  // r15 contains the code list pointer (points to next code line after current one).
+  // CR7 contains the execution enable state (Equal = on, NotEqual = off)
+  if (!GetCRBit(30))  // CR7[EQ]
+    return;
+
+  u32 pointer = GPR(12) + GPR(3);
+  u32 length = 0;
+  switch (GPR(5))  // Subtype is 3bits (0-7)
+  {
+  case 0:  // _write816 (u8 ), Y times [00XXXXXX YYYY00ZZ]
+  case 1:  // _write816 (u16), Y times [02XXXXXX YYYYZZZZ]
+    length = (GPR(4) >> 16) << GPR(5);
+    break;
+
+  case 2:  // _write32 [04XXXXXX ZZZZZZZZ]
+    length = 4;
+    break;
+
+  case 3:  // _write_string [06XXXXXX YYYYYYYY AAAAAAAA BBBBBBBB CCCCCCCC ...]
+    length = GPR(4);
+    break;
+
+  case 4:  // _write_serial [08XXXXXX YYYYYYYY TNNNZZZZ VVVVVVVV]
+  {
+    // "Write Serial" is a non-contiguous pattern fill. The instruction is double length.
+    // NNN is the iteration count, ZZZZ is the stride.
+    u32 line2_addr = PowerPC::HostRead_U32(GPR(15));
+    u32 iterations = (line2_addr >> 16) & 0xFFF;
+    u32 stride = line2_addr & 0xFFFF;
+    while (iterations--)
+    {
+      PowerPC::ppcState.iCache.Invalidate(pointer);
+      pointer += stride;
+    }
+    return;
+  }
+
+  default:
+    return;
+  }
+
+  // Align length to cache lines
+  u32 iterations = static_cast<u32>(static_cast<u64>(length) + (pointer & 31) + 31) / 32;
+  for (; iterations--; pointer += 32)
+  {
+    PowerPC::ppcState.iCache.Invalidate(pointer);
+  }
+}
+
 // Because Dolphin messes around with the CPU state instead of patching the game binary, we
 // need a way to branch into the GCH from an arbitrary PC address. Branching is easy, returning
 // back is the hard part. This HLE function acts as a trampoline that restores the original LR, SP,
